@@ -28,8 +28,8 @@ Le **Leader Key** est le préfixe nécessaire pour les commandes système.
 
 | Action | Direction | Touche |
 | :--- | :--- | :--- |
-| **Move** | Gauche / Bas / Haut / Droite | `h` / `j` / `k` / `l` |
-| **Resize** | Gauche / Bas / Haut / Droite | *(Selon config `split_nav`)* |
+| **Move** | Gauche / Bas / Haut / Droite | `CTRL` + `h` / `j` / `k` / `l` |
+| **Resize** | Gauche / Bas / Haut / Droite | `META` + `h` / `j` / `k` / `l` |
 
 ---
 

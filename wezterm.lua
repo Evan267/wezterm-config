@@ -7,5 +7,6 @@ bar.apply_to_config(config)
 quota.apply_to_config(config)
 
 require('lua/options').apply(config)
+require('lua/keys').apply(config)
 
 return config

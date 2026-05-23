@@ -9,7 +9,6 @@ Structure actuelle :
 - `wezterm.lua` : point d'entree de la configuration.
 - `lua/options.lua` : options visuelles et comportementales de base.
 - `lua/keys.lua` : raccourcis clavier personnalises et navigation de panneaux.
-- `lua/status.lua` : reserve a la future personnalisation de statut.
 - `WEZTERM_SHORTCUTS.md` : aide-memoire utilisateur des raccourcis.
 
 ## Etat actuel
@@ -19,8 +18,7 @@ La configuration active charge actuellement :
 - `bar.wezterm` pour la barre WezTerm.
 - `wezterm-quota-limit` pour la gestion de quota.
 - `lua/options.lua` pour les options generales.
-
-Attention : `lua/keys.lua` existe, mais n'est pas charge par `wezterm.lua` dans l'etat courant. Les raccourcis qui y sont definis ne seront donc pas actifs tant que `require('lua/keys').apply(config)` n'est pas restaure dans `wezterm.lua`.
+- `lua/keys.lua` pour les raccourcis clavier.
 
 La persistance automatique de session n'est pas active dans cette configuration afin d'eviter les problemes rencontres sous Windows.
 
@@ -53,10 +51,8 @@ Les raccourcis doivent rester regroupes dans `lua/keys.lua`. La touche leader ac
 
 La navigation de panneaux utilise les touches Vim :
 
-- `h` : gauche
-- `j` : bas
-- `k` : haut
-- `l` : droite
+- `CTRL+h/j/k/l` : changer de panneau.
+- `META+h/j/k/l` : redimensionner le panneau actif.
 
 Le helper `split_nav` transmet les touches a Neovim si la variable utilisateur `IS_NVIM` vaut `true`. Cela permet de conserver une navigation coherente entre WezTerm et Neovim.
 
@@ -90,5 +86,4 @@ Avant de considerer une modification terminee :
 
 - Les plugins WezTerm peuvent necessiter un acces reseau au premier chargement.
 - Les raccourcis documentes ne sont fiables que si `lua/keys.lua` est effectivement applique dans `wezterm.lua`.
-- `lua/status.lua` est vide pour l'instant ; ne pas y ajouter de logique sans besoin clair.
 - Eviter de reintroduire un plugin de persistance de session sans validation specifique sous Windows.

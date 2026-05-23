@@ -18,6 +18,10 @@ function M.apply(config)
     config.window_background_opacity = 0.95
     
     config.window_padding = { left = 5, right = 5, top = 5, bottom = 5 }
+
+    if wezterm.target_triple:find('windows') then
+        config.default_prog = { 'wsl.exe', '-d', 'Debian', '--cd', '~' }
+    end
     
     config.inactive_pane_hsb = {
         saturation = 0.9,
