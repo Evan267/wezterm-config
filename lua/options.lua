@@ -1,8 +1,17 @@
 local wezterm = require 'wezterm'
 local M = {}
 
+local function color_scheme_for_appearance(appearance)
+    if appearance:find('Dark') then
+        return 'Catppuccin Mocha'
+    end
+
+    return 'Catppuccin Latte'
+end
+
 function M.apply(config)
-    config.color_scheme = 'Catppuccin Mocha'
+    local appearance = wezterm.gui and wezterm.gui.get_appearance() or 'Dark'
+    config.color_scheme = color_scheme_for_appearance(appearance)
     config.font = wezterm.font('JetBrains Mono')
     
     config.window_decorations = "RESIZE"
