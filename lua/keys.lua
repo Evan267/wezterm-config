@@ -1,4 +1,5 @@
 local w = require 'wezterm'
+local workspaces = require 'lua/workspaces'
 local M = {}
 
 local function is_vim(pane)
@@ -55,24 +56,49 @@ function M.apply(config)
       key = 'n',
       mods = 'ALT',
       action = w.action_callback(function(window, pane)
-	window:perform_action(
-	  w.action.PromptInputLine {
-	    description = w.format {
-	      { Attribute = { Intensity = 'Bold' } },
-	      { Foreground = { AnsiColor = 'Fuchsia' } },
-	      { Text = 'Nommer le nouveau Workspace: ' },
-	    },
-	    action = w.action_callback(function(win, p, line)
-	      if line and line ~= "" then
-		win:perform_action(
-		  w.action.SwitchToWorkspace { name = line },
-		  p
-		)
-	      end
-	    end),
-	  },
-	  pane
-	)
+	workspaces.prompt_new_workspace(window, pane)
+      end),
+    },
+    {
+      key = 'r',
+      mods = 'ALT',
+      action = w.action_callback(function(window, pane)
+	workspaces.save_current(window, pane)
+      end),
+    },
+    {
+      key = 'o',
+      mods = 'ALT',
+      action = w.action_callback(function(window, pane)
+	workspaces.choose_registered(window, pane, 'current')
+      end),
+    },
+    {
+      key = 'O',
+      mods = 'ALT',
+      action = w.action_callback(function(window, pane)
+	workspaces.choose_registered(window, pane, 'new')
+      end),
+    },
+    {
+      key = 'd',
+      mods = 'ALT',
+      action = w.action_callback(function(window, pane)
+	workspaces.choose_delete_registered(window, pane)
+      end),
+    },
+    {
+      key = 'LeftArrow',
+      mods = 'ALT',
+      action = w.action_callback(function(window, pane)
+	workspaces.activate_relative(window, pane, -1)
+      end),
+    },
+    {
+      key = 'RightArrow',
+      mods = 'ALT',
+      action = w.action_callback(function(window, pane)
+	workspaces.activate_relative(window, pane, 1)
       end),
     },
   }

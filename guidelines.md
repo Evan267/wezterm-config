@@ -8,6 +8,7 @@ Structure actuelle :
 
 - `wezterm.lua` : point d'entree de la configuration.
 - `lua/options.lua` : options visuelles et comportementales de base.
+- `lua/status.lua` : barre native WezTerm et titres d'onglets.
 - `lua/keys.lua` : raccourcis clavier personnalises et navigation de panneaux.
 - `WEZTERM_SHORTCUTS.md` : aide-memoire utilisateur des raccourcis.
 
@@ -15,9 +16,9 @@ Structure actuelle :
 
 La configuration active charge actuellement :
 
-- `bar.wezterm` pour la barre WezTerm.
 - `wezterm-quota-limit` pour la gestion de quota.
 - `lua/options.lua` pour les options generales.
+- `lua/status.lua` pour la barre native WezTerm.
 - `lua/keys.lua` pour les raccourcis clavier.
 
 La persistance automatique de session n'est pas active dans cette configuration afin d'eviter les problemes rencontres sous Windows.
