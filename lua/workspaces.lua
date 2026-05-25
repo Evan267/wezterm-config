@@ -233,6 +233,23 @@ local function shell_command_args(command)
   }
 end
 
+local function tmux_session_name(name)
+  name = canonical_workspace_name(name or 'default')
+  name = name:gsub('[^%w_.%-]', '_')
+
+  if name == '' then
+    return 'default'
+  end
+
+  return name
+end
+
+local function tmux_workspace_spawn(name)
+  return {
+    args = { 'tmux', 'new-session', '-A', '-s', tmux_session_name(name) },
+  }
+end
+
 local function path_exists(path)
   if type(path) ~= 'string' or path == '' then
     return false
@@ -1024,7 +1041,7 @@ local function restore_workspace(window, pane, workspace, mode)
   if type(workspace.tabs) ~= 'table' or #workspace.tabs == 0 then
     append_debug('restore legacy workspace name=' .. tostring(workspace.name))
     local args = { name = workspace.name }
-    local spawn = pane_spawn(workspace)
+    local spawn = pane_spawn(workspace) or tmux_workspace_spawn(workspace.name)
 
     if spawn then
       args.spawn = spawn
@@ -1055,7 +1072,10 @@ function M.prompt_new_workspace(window, pane)
       },
       action = wezterm.action_callback(function(win, p, line)
         if line and line ~= '' then
-          win:perform_action(wezterm.action.SwitchToWorkspace { name = line }, p)
+          win:perform_action(wezterm.action.SwitchToWorkspace {
+            name = line,
+            spawn = tmux_workspace_spawn(line),
+          }, p)
         end
       end),
     },

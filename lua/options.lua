@@ -4,6 +4,8 @@ local M = {}
 local DYNAMIC_COLOR_SCHEME_EVENT_VERSION = 5
 local WINDOWS_THEME_REG_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize'
 local DEFAULT_WSL_DISTRO = 'Debian'
+local DEFAULT_SSH_DOMAIN = 'tailscale-100.108.20.16'
+local DEFAULT_TMUX_SESSION = 'wezterm'
 
 local function is_windows()
     return wezterm.target_triple:find('windows') ~= nil
@@ -122,6 +124,16 @@ function M.apply(config)
     config.font = wezterm.font('JetBrains Mono')
     config.status_update_interval = 1000
     config.exit_behavior = 'Close'
+    config.ssh_domains = {
+        {
+            name = DEFAULT_SSH_DOMAIN,
+            remote_address = '100.108.20.16',
+            username = 'evan',
+            multiplexing = 'None',
+            default_prog = { 'tmux', 'new-session', '-A', '-s', DEFAULT_TMUX_SESSION },
+        },
+    }
+    config.default_domain = DEFAULT_SSH_DOMAIN
     
     config.window_decorations = "RESIZE"
     config.window_background_opacity = 0.95
@@ -131,18 +143,6 @@ function M.apply(config)
     if is_windows() then
         local distro = wsl_distro()
         wezterm.GLOBAL.wsl_distro = distro
-        config.default_prog = {
-            'wsl.exe',
-            '-d',
-            distro,
-            '--cd',
-            '~',
-            '--',
-            'bash',
-            '--init-file',
-            windows_path_to_wsl(wezterm.config_dir .. '/shell/bash-workspace-tracker.bash'),
-            '-i',
-        }
     end
     
     config.inactive_pane_hsb = {
