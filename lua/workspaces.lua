@@ -5,6 +5,7 @@ local registry_path = wezterm.config_dir .. '/workspaces.json'
 local debug_path = wezterm.config_dir .. '/workspaces-debug.log'
 local snapshot_version = 1
 local default_wsl_distro = 'Debian'
+local remote_ssh_target = 'evan@100.108.20.16'
 local notification_duration = 2500
 local error_notification_duration = 5000
 local notification_serial = 0
@@ -244,6 +245,11 @@ local function tmux_session_name(name)
   return name
 end
 
+local function is_named_workspace(name)
+  name = canonical_workspace_name(name)
+  return name ~= '' and name ~= 'default'
+end
+
 local function tmux_slot_name(slot)
   slot = tostring(slot or 'main'):gsub('[^%w_.%-]', '_')
 
@@ -270,6 +276,49 @@ local function tmux_workspace_spawn(name, slot)
   return {
     args = { 'sh', '-lc', script },
   }
+end
+
+local function normal_shell_spawn()
+  return {
+    args = { 'sh', '-l' },
+  }
+end
+
+local function ssh_command()
+  if wezterm.target_triple:find('windows') ~= nil then
+    return 'ssh.exe'
+  end
+
+  return 'ssh'
+end
+
+local function kill_workspace_tmux_sessions(name)
+  if not is_named_workspace(name) then
+    return true
+  end
+
+  local group = tmux_session_name(name)
+  local script = table.concat({
+    'group=' .. bash_quote(group),
+    'tmux list-sessions -F "#{session_name}" 2>/dev/null | while IFS= read -r session; do case "$session" in "$group"|"$group"__wezterm_*) tmux kill-session -t "$session" ;; esac; done',
+  }, '; ')
+
+  local ok, success, stdout, stderr = pcall(function()
+    return wezterm.run_child_process({ ssh_command(), remote_ssh_target, 'sh -lc ' .. bash_quote(script) })
+  end)
+
+  if ok and success == true then
+    return true
+  end
+
+  append_debug(
+    'tmux cleanup failed name=' .. tostring(name)
+      .. ' ok=' .. tostring(ok)
+      .. ' success=' .. tostring(success)
+      .. ' stdout=' .. tostring(stdout)
+      .. ' stderr=' .. tostring(stderr)
+  )
+  return false
 end
 
 local function path_exists(path)
@@ -1216,7 +1265,7 @@ function M.split_tmux_pane(window, pane, direction)
   local split_args = {
     direction = direction,
   }
-  local spawn = tmux_split_spawn(window, pane)
+  local spawn = is_named_workspace(workspace_name(window)) and tmux_split_spawn(window) or normal_shell_spawn()
 
   for key, value in pairs(spawn) do
     split_args[key] = value
@@ -1234,7 +1283,7 @@ end
 
 function M.spawn_tmux_tab(window)
   local mux_window = window:mux_window()
-  local spawn = tmux_tab_spawn(window)
+  local spawn = is_named_workspace(workspace_name(window)) and tmux_tab_spawn(window) or normal_shell_spawn()
   local ok, err = pcall(function()
     mux_window:spawn_tab(spawn)
   end)
@@ -1406,7 +1455,11 @@ function M.choose_delete_registered(window, pane)
 
         if ok and removed then
           append_debug('delete workspace name=' .. tostring(name))
-          notify(win, 'Workspace supprime: ' .. name)
+          if kill_workspace_tmux_sessions(name) then
+            notify(win, 'Workspace supprime: ' .. name)
+          else
+            notify_error(win, 'Workspace supprime, tmux non nettoye: ' .. name)
+          end
         else
           append_debug('delete failed name=' .. tostring(name) .. ' err=' .. tostring(removed))
           notify_error(win, 'Impossible de supprimer: ' .. name)
