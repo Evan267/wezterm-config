@@ -5,8 +5,8 @@ local registry_path = wezterm.config_dir .. '/workspaces.json'
 local debug_path = wezterm.config_dir .. '/workspaces-debug.log'
 local snapshot_version = 1
 local default_wsl_distro = 'Debian'
-local notification_duration = 1000
-local error_notification_duration = 2500
+local notification_duration = 2500
+local error_notification_duration = 5000
 local notification_serial = 0
 
 local shell_names = {
@@ -64,6 +64,10 @@ local function notify(window, message, duration)
   duration = duration or notification_duration
   notification_serial = notification_serial + 1
   local serial = notification_serial
+
+  pcall(function()
+    window:toast_notification('WezTerm', message, nil, duration)
+  end)
 
   window:set_right_status(wezterm.format {
     { Attribute = { Intensity = 'Bold' } },
