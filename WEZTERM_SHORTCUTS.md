@@ -40,6 +40,7 @@ Les commandes de workspace utilisent uniquement `ALT` comme modificateur. Les va
 | Raccourci | Action | Description |
 | :--- | :--- | :--- |
 | `ALT` + `n` | **Nouveau Workspace** | Demande un nom puis bascule vers ce workspace non enregistre |
+| `ALT` + `t` | **Renommer Tab** | Demande un nom pour le tab actif puis enregistre le workspace courant |
 | `ALT` + `r` | **Enregistrer Workspace** | Enregistre ou met a jour le workspace actif |
 | `ALT` + `o` | **Ouvrir Workspace ici** | Affiche les workspaces enregistres et ouvre la selection dans la fenetre courante |
 | `ALT` + `SHIFT` + `o` | **Ouvrir Workspace en fenetre** | Focalise la fenetre existante si le workspace est deja ouvert; sinon restaure la selection dans une nouvelle fenetre |
@@ -55,6 +56,7 @@ Les commandes de workspace utilisent uniquement `ALT` comme modificateur. Les va
 * **Registre** : Les workspaces sauvegardes sont stockes dans `workspaces.json` a la racine de cette configuration.
 * **Sortie** : `exit_behavior = 'Close'` ferme les panes des que leur process se termine, meme si le dernier code de sortie n'est pas zero.
 * **Sauvegarde workspace** : La sauvegarde conserve les tabs, les panes/splits, le repertoire courant de chaque pane et la derniere commande executee.
+* **Titres de tabs** : Les titres definis avec `ALT` + `t` sont stockes dans `workspaces.json` et reappliques lors de la restauration.
 * **Restauration workspace** : Si le workspace est deja ouvert, la config le rejoint sans relancer les commandes. Sinon, elle recree les tabs/panes, retourne dans les repertoires sauvegardes et relance la derniere commande quand elle est disponible.
 * **Suppression workspace** : La suppression retire uniquement l'entree du registre; elle ne ferme pas un workspace deja ouvert.
 * **Suivi shell** : Le fichier `shell/bash-workspace-tracker.bash` publie le repertoire courant et la derniere commande a WezTerm via des user vars.

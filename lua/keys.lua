@@ -60,6 +60,13 @@ function M.apply(config)
       end),
     },
     {
+      key = 't',
+      mods = 'ALT',
+      action = w.action_callback(function(window, pane)
+	workspaces.prompt_rename_active_tab(window, pane)
+      end),
+    },
+    {
       key = 'r',
       mods = 'ALT',
       action = w.action_callback(function(window, pane)

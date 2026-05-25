@@ -48,6 +48,14 @@ local function pane_title(pane)
   return basename(pane:get_foreground_process_name()) or 'shell'
 end
 
+local function tab_title(tab)
+  if tab.tab_title and tab.tab_title ~= '' then
+    return tab.tab_title
+  end
+
+  return pane_title(tab.active_pane)
+end
+
 function M.apply(config)
   config.use_fancy_tab_bar = false
   config.hide_tab_bar_if_only_one_tab = false
@@ -59,7 +67,7 @@ function M.apply(config)
     local bg = tab.is_active and c.active_bg or c.inactive_bg
     local fg = tab.is_active and c.fg or c.muted
     local edge_fg = tab.is_active and c.accent or c.edge
-    local title = pane_title(tab.active_pane)
+    local title = tab_title(tab)
     local index = tostring(tab.tab_index + 1)
     local text = ' ' .. index .. ' ' .. title .. ' '
 

@@ -337,6 +337,44 @@ local function tab_title(tab)
   return nil
 end
 
+local function set_tab_title(tab, title)
+  if type(title) ~= 'string' or title == '' then
+    return
+  end
+
+  pcall(function()
+    tab:set_title(title)
+  end)
+end
+
+local function active_tab(window)
+  local ok, tab = pcall(function()
+    return window:active_tab()
+  end)
+
+  if ok and tab then
+    return tab
+  end
+
+  ok, tab = pcall(function()
+    return window:mux_window():active_tab()
+  end)
+
+  if ok and tab then
+    return tab
+  end
+
+  local mux_window = window:mux_window()
+
+  for _, item in ipairs(mux_window:tabs_with_info()) do
+    if item.is_active then
+      return item.tab
+    end
+  end
+
+  return nil
+end
+
 local function cwd_from_title(title)
   if type(title) ~= 'string' then
     return nil
@@ -840,7 +878,7 @@ end
 
 local function restore_workspace_in_new_window(window, pane, workspace)
   local first_tab = workspace.tabs[1]
-  local ok, _, first_mux_pane, mux_window = pcall(function()
+  local ok, first_mux_tab, first_mux_pane, mux_window = pcall(function()
     return wezterm.mux.spawn_window(merge_spawn_options({
       position = { origin = 'ActiveScreen', x = 80, y = 80 },
     }, pane_spawn(first_pane(first_tab)) or { cwd = workspace.cwd }))
@@ -853,6 +891,7 @@ local function restore_workspace_in_new_window(window, pane, workspace)
   end
 
   append_debug('restore spawn_window ok name=' .. tostring(workspace.name))
+  set_tab_title(first_mux_tab, first_tab.title)
 
   local layout_ok, layout_err = pcall(function()
     apply_layout(first_mux_pane, build_layout(first_tab.panes or {}))
@@ -864,9 +903,11 @@ local function restore_workspace_in_new_window(window, pane, workspace)
 
   for index = 2, #workspace.tabs do
     local tab_snapshot = workspace.tabs[index]
-    local _, new_pane = mux_window:spawn_tab(
+    local new_tab, new_pane = mux_window:spawn_tab(
       merge_spawn_options({}, pane_spawn(first_pane(tab_snapshot)) or { cwd = workspace.cwd })
     )
+
+    set_tab_title(new_tab, tab_snapshot.title)
 
     pcall(function()
       apply_layout(new_pane, build_layout(tab_snapshot.panes or {}))
@@ -889,15 +930,17 @@ local function restore_layout_in_current_window(window, workspace)
     end
 
     local first_mux_pane = mux_window:active_pane()
+    set_tab_title(mux_window:active_tab(), first_tab.title)
 
     apply_layout(first_mux_pane, build_layout(first_tab.panes or {}))
 
     for index = 2, #workspace.tabs do
       local tab_snapshot = workspace.tabs[index]
-      local _, new_pane = mux_window:spawn_tab(
+      local new_tab, new_pane = mux_window:spawn_tab(
         merge_spawn_options({}, pane_spawn(first_pane(tab_snapshot)) or { cwd = workspace.cwd })
       )
 
+      set_tab_title(new_tab, tab_snapshot.title)
       apply_layout(new_pane, build_layout(tab_snapshot.panes or {}))
     end
   end)
@@ -1060,6 +1103,37 @@ function M.prompt_save_current(window, pane)
           local name = line ~= '' and line or workspace_name(win)
           M.save_current(win, p, name)
         end
+      end),
+    },
+    pane
+  )
+end
+
+function M.prompt_rename_active_tab(window, pane)
+  local current_title = tab_title(active_tab(window)) or pane_title(pane) or ''
+
+  window:perform_action(
+    wezterm.action.PromptInputLine {
+      description = wezterm.format {
+        { Attribute = { Intensity = 'Bold' } },
+        { Foreground = { AnsiColor = 'Fuchsia' } },
+        { Text = 'Renommer le tab (' .. current_title .. '): ' },
+      },
+      action = wezterm.action_callback(function(win, p, line)
+        if not line then
+          return
+        end
+
+        local name = line ~= '' and line or current_title
+        local tab = active_tab(win)
+
+        if not tab then
+          notify_error(win, 'Tab actif introuvable')
+          return
+        end
+
+        set_tab_title(tab, name)
+        M.save_current(win, p)
       end),
     },
     pane
