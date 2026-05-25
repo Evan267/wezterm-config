@@ -39,8 +39,20 @@ function M.apply(config)
 
   config.keys = {
     { key = 't', mods = 'LEADER', action = w.action.SpawnTab 'DefaultDomain' },
-    { key = 'v', mods = 'LEADER', action = w.action.SplitHorizontal { domain = 'CurrentPaneDomain' } },
-    { key = 's', mods = 'LEADER', action = w.action.SplitVertical { domain = 'CurrentPaneDomain' } },
+    {
+      key = 'v',
+      mods = 'LEADER',
+      action = w.action_callback(function(window, pane)
+	workspaces.split_tmux_pane(window, pane, 'Right')
+      end),
+    },
+    {
+      key = 's',
+      mods = 'LEADER',
+      action = w.action_callback(function(window, pane)
+	workspaces.split_tmux_pane(window, pane, 'Bottom')
+      end),
+    },
     { key = 'w', mods = 'LEADER', action = w.action.CloseCurrentPane { confirm = true } },
     split_nav('move', 'h'),
     split_nav('move', 'j'),

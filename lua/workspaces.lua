@@ -8,6 +8,7 @@ local default_wsl_distro = 'Debian'
 local notification_duration = 2500
 local error_notification_duration = 5000
 local notification_serial = 0
+local tmux_split_serial = 0
 
 local shell_names = {
   bash = true,
@@ -598,6 +599,27 @@ local function workspace_tmux_pane_spawn(workspace, tab_index, pane_index)
   return tmux_workspace_spawn(workspace.name, 'tab' .. tostring(tab_index) .. '_pane' .. tostring(pane_index))
 end
 
+local function pane_id(pane)
+  local ok, id = pcall(function()
+    return pane:pane_id()
+  end)
+
+  if ok and id then
+    return tostring(id)
+  end
+
+  return 'active'
+end
+
+local function tmux_split_spawn(window, pane)
+  tmux_split_serial = tmux_split_serial + 1
+
+  return tmux_workspace_spawn(
+    workspace_name(window),
+    'split_' .. pane_id(pane) .. '_' .. tostring(os.time()) .. '_' .. tostring(tmux_split_serial)
+  )
+end
+
 local function focus_mux_window(mux_window)
   if not mux_window then
     return
@@ -1111,6 +1133,26 @@ function M.prompt_new_workspace(window, pane)
     },
     pane
   )
+end
+
+function M.split_tmux_pane(window, pane, direction)
+  local split_args = {
+    direction = direction,
+  }
+  local spawn = tmux_split_spawn(window, pane)
+
+  for key, value in pairs(spawn) do
+    split_args[key] = value
+  end
+
+  local ok, err = pcall(function()
+    pane:split(split_args)
+  end)
+
+  if not ok then
+    append_debug('tmux split failed: ' .. tostring(err))
+    notify_error(window, 'Impossible d ouvrir un pane tmux')
+  end
 end
 
 function M.save_current(window, pane, name)
