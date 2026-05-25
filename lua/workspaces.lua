@@ -260,18 +260,35 @@ local function tmux_slot_name(slot)
   return slot
 end
 
-local function tmux_workspace_spawn(name, slot)
+local function tmux_workspace_spawn(name, slot, options)
+  options = options or {}
   local group = tmux_session_name(name)
   local base = group .. '__wezterm_' .. tmux_slot_name(slot)
-  local script = table.concat({
+  local commands = {
     'group=' .. bash_quote(group),
     'base=' .. bash_quote(base),
     'client="$base"',
     'tmux has-session -t "$group" 2>/dev/null || tmux new-session -d -s "$group"',
-    'if tmux has-session -t "$client" 2>/dev/null && tmux list-clients -t "$client" >/dev/null 2>&1; then i=1; while tmux has-session -t "${base}_${i}" 2>/dev/null && tmux list-clients -t "${base}_${i}" >/dev/null 2>&1; do i=$((i + 1)); done; client="${base}_${i}"; fi',
-    'tmux has-session -t "$client" 2>/dev/null || tmux new-session -d -t "$group" -s "$client"',
-    'exec tmux attach-session -t "$client"',
-  }, '; ')
+  }
+
+  if options.replace_slot then
+    table.insert(
+      commands,
+      'tmux list-sessions -F "#{session_name}" 2>/dev/null | while IFS= read -r session; do case "$session" in "$base"|"$base"_*) tmux kill-session -t "$session" ;; esac; done'
+    )
+  end
+
+  table.insert(commands,
+    'if tmux has-session -t "$client" 2>/dev/null && tmux list-clients -t "$client" >/dev/null 2>&1; then i=1; while tmux has-session -t "${base}_${i}" 2>/dev/null && tmux list-clients -t "${base}_${i}" >/dev/null 2>&1; do i=$((i + 1)); done; client="${base}_${i}"; fi'
+  )
+  table.insert(commands,
+    'tmux has-session -t "$client" 2>/dev/null || tmux new-session -d -t "$group" -s "$client"'
+  )
+  table.insert(commands,
+    'exec tmux attach-session -t "$client"'
+  )
+
+  local script = table.concat(commands, '; ')
 
   return {
     args = { 'sh', '-lc', script },
@@ -701,14 +718,16 @@ end
 local function tmux_split_spawn(window)
   return tmux_workspace_spawn(
     workspace_name(window),
-    'tab' .. tostring(active_tab_index(window)) .. '_pane' .. tostring(active_tab_pane_count(window) + 1)
+    'tab' .. tostring(active_tab_index(window)) .. '_pane' .. tostring(active_tab_pane_count(window) + 1),
+    { replace_slot = true }
   )
 end
 
 local function tmux_tab_spawn(window)
   return tmux_workspace_spawn(
     workspace_name(window),
-    'tab' .. tostring(tab_count(window) + 1) .. '_pane1'
+    'tab' .. tostring(tab_count(window) + 1) .. '_pane1',
+    { replace_slot = true }
   )
 end
 
