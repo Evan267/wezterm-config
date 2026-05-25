@@ -121,6 +121,7 @@ function M.apply(config)
     config.color_scheme = color_scheme
     config.font = wezterm.font('JetBrains Mono')
     config.status_update_interval = 1000
+    config.exit_behavior = 'Close'
     
     config.window_decorations = "RESIZE"
     config.window_background_opacity = 0.95

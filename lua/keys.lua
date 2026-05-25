@@ -88,6 +88,11 @@ function M.apply(config)
       end),
     },
     {
+      key = 'Q',
+      mods = 'ALT',
+      action = w.action.QuitApplication,
+    },
+    {
       key = 'LeftArrow',
       mods = 'ALT',
       action = w.action_callback(function(window, pane)
