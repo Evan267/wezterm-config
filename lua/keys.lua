@@ -38,7 +38,13 @@ function M.apply(config)
   config.leader = { key = 'b', mods = 'CTRL', timeout_milliseconds = 1000 }
 
   config.keys = {
-    { key = 't', mods = 'LEADER', action = w.action.SpawnTab 'DefaultDomain' },
+    {
+      key = 't',
+      mods = 'LEADER',
+      action = w.action_callback(function(window, pane)
+	workspaces.spawn_tmux_tab(window, pane)
+      end),
+    },
     {
       key = 'v',
       mods = 'LEADER',

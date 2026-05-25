@@ -8,7 +8,6 @@ local default_wsl_distro = 'Debian'
 local notification_duration = 2500
 local error_notification_duration = 5000
 local notification_serial = 0
-local tmux_split_serial = 0
 
 local shell_names = {
   bash = true,
@@ -599,24 +598,68 @@ local function workspace_tmux_pane_spawn(workspace, tab_index, pane_index)
   return tmux_workspace_spawn(workspace.name, 'tab' .. tostring(tab_index) .. '_pane' .. tostring(pane_index))
 end
 
-local function pane_id(pane)
-  local ok, id = pcall(function()
-    return pane:pane_id()
+local function active_tab_index(window)
+  local mux_window = window:mux_window()
+  local ok, tabs = pcall(function()
+    return mux_window:tabs_with_info()
   end)
 
-  if ok and id then
-    return tostring(id)
+  if ok and type(tabs) == 'table' then
+    for index, item in ipairs(tabs) do
+      if item.is_active then
+        return index
+      end
+    end
   end
 
-  return 'active'
+  return 1
 end
 
-local function tmux_split_spawn(window, pane)
-  tmux_split_serial = tmux_split_serial + 1
+local function tab_count(window)
+  local mux_window = window:mux_window()
+  local ok, tabs = pcall(function()
+    return mux_window:tabs()
+  end)
 
+  if ok and type(tabs) == 'table' then
+    return #tabs
+  end
+
+  ok, tabs = pcall(function()
+    return mux_window:tabs_with_info()
+  end)
+
+  if ok and type(tabs) == 'table' then
+    return #tabs
+  end
+
+  return 1
+end
+
+local function active_tab_pane_count(window)
+  local tab = active_tab(window)
+  local ok, panes = pcall(function()
+    return tab:panes_with_info()
+  end)
+
+  if ok and type(panes) == 'table' then
+    return #panes
+  end
+
+  return 1
+end
+
+local function tmux_split_spawn(window)
   return tmux_workspace_spawn(
     workspace_name(window),
-    'split_' .. pane_id(pane) .. '_' .. tostring(os.time()) .. '_' .. tostring(tmux_split_serial)
+    'tab' .. tostring(active_tab_index(window)) .. '_pane' .. tostring(active_tab_pane_count(window) + 1)
+  )
+end
+
+local function tmux_tab_spawn(window)
+  return tmux_workspace_spawn(
+    workspace_name(window),
+    'tab' .. tostring(tab_count(window) + 1) .. '_pane1'
   )
 end
 
@@ -899,12 +942,42 @@ local function build_layout(panes)
   return { kind = 'stack', panes = panes }
 end
 
-local function next_tmux_layout_spawn(workspace, tab_index, pane_counter)
-  pane_counter.count = pane_counter.count + 1
-  return workspace_tmux_pane_spawn(workspace, tab_index, pane_counter.count)
+local function build_tab_layout(tab_snapshot)
+  local panes = {}
+
+  if type(tab_snapshot) ~= 'table' or type(tab_snapshot.panes) ~= 'table' then
+    return nil
+  end
+
+  for index, pane in ipairs(tab_snapshot.panes) do
+    local copy = {}
+
+    for key, value in pairs(pane) do
+      copy[key] = value
+    end
+
+    copy.tmux_pane_index = index
+    table.insert(panes, copy)
+  end
+
+  return build_layout(panes)
 end
 
-local function apply_layout(target_pane, node, workspace, tab_index, pane_counter)
+local function tmux_layout_spawn(workspace, tab_index, pane_snapshot)
+  local pane_index = type(pane_snapshot) == 'table' and pane_snapshot.tmux_pane_index or nil
+
+  if not pane_index then
+    return tmux_workspace_spawn(workspace.name, 'tab' .. tostring(tab_index) .. '_pane_extra')
+  end
+
+  return workspace_tmux_pane_spawn(workspace, tab_index, pane_index)
+end
+
+local function first_layout_spawn(workspace, tab_index, layout)
+  return tmux_layout_spawn(workspace, tab_index, first_leaf_pane(layout))
+end
+
+local function apply_layout(target_pane, node, workspace, tab_index)
   if not node or node.kind == 'pane' then
     return
   end
@@ -919,7 +992,7 @@ local function apply_layout(target_pane, node, workspace, tab_index, pane_counte
       direction = node.direction,
       size = percent / 100,
     }
-    local spawn = next_tmux_layout_spawn(workspace, tab_index, pane_counter)
+    local spawn = tmux_layout_spawn(workspace, tab_index, first_leaf_pane(node.second))
 
     if spawn then
       for key, value in pairs(spawn) do
@@ -928,15 +1001,15 @@ local function apply_layout(target_pane, node, workspace, tab_index, pane_counte
     end
 
     local new_pane = target_pane:split(split_args)
-    apply_layout(target_pane, node.first, workspace, tab_index, pane_counter)
-    apply_layout(new_pane, node.second, workspace, tab_index, pane_counter)
+    apply_layout(target_pane, node.first, workspace, tab_index)
+    apply_layout(new_pane, node.second, workspace, tab_index)
     return
   end
 
   if node.kind == 'stack' then
     for index = 2, #node.panes do
       local split_args = { direction = 'Bottom', size = 0.5 }
-      local spawn = next_tmux_layout_spawn(workspace, tab_index, pane_counter)
+      local spawn = tmux_layout_spawn(workspace, tab_index, node.panes[index])
 
       if spawn then
         for key, value in pairs(spawn) do
@@ -951,10 +1024,11 @@ end
 
 local function restore_workspace_in_new_window(window, pane, workspace)
   local first_tab = workspace.tabs[1]
+  local first_layout = build_tab_layout(first_tab)
   local ok, first_mux_tab, first_mux_pane, mux_window = pcall(function()
     return wezterm.mux.spawn_window(merge_spawn_options({
       position = { origin = 'ActiveScreen', x = 80, y = 80 },
-    }, workspace_tmux_pane_spawn(workspace, 1, 1)))
+    }, first_layout_spawn(workspace, 1, first_layout)))
   end)
 
   if not ok or not mux_window then
@@ -967,7 +1041,7 @@ local function restore_workspace_in_new_window(window, pane, workspace)
   set_tab_title(first_mux_tab, first_tab.title)
 
   local layout_ok, layout_err = pcall(function()
-    apply_layout(first_mux_pane, build_layout(first_tab.panes or {}), workspace, 1, { count = 1 })
+    apply_layout(first_mux_pane, first_layout, workspace, 1)
   end)
 
   if not layout_ok then
@@ -976,14 +1050,15 @@ local function restore_workspace_in_new_window(window, pane, workspace)
 
   for index = 2, #workspace.tabs do
     local tab_snapshot = workspace.tabs[index]
+    local tab_layout = build_tab_layout(tab_snapshot)
     local new_tab, new_pane = mux_window:spawn_tab(
-      merge_spawn_options({}, workspace_tmux_pane_spawn(workspace, index, 1))
+      merge_spawn_options({}, first_layout_spawn(workspace, index, tab_layout))
     )
 
     set_tab_title(new_tab, tab_snapshot.title)
 
     pcall(function()
-      apply_layout(new_pane, build_layout(tab_snapshot.panes or {}), workspace, index, { count = 1 })
+      apply_layout(new_pane, tab_layout, workspace, index)
     end)
   end
 
@@ -994,6 +1069,7 @@ end
 
 local function restore_layout_in_current_window(window, workspace)
   local first_tab = workspace.tabs[1]
+  local first_layout = build_tab_layout(first_tab)
   local ok, err = pcall(function()
     local mux_window = window:mux_window()
 
@@ -1005,16 +1081,17 @@ local function restore_layout_in_current_window(window, workspace)
     local first_mux_pane = mux_window:active_pane()
     set_tab_title(mux_window:active_tab(), first_tab.title)
 
-    apply_layout(first_mux_pane, build_layout(first_tab.panes or {}), workspace, 1, { count = 1 })
+    apply_layout(first_mux_pane, first_layout, workspace, 1)
 
     for index = 2, #workspace.tabs do
       local tab_snapshot = workspace.tabs[index]
+      local tab_layout = build_tab_layout(tab_snapshot)
       local new_tab, new_pane = mux_window:spawn_tab(
-        merge_spawn_options({}, workspace_tmux_pane_spawn(workspace, index, 1))
+        merge_spawn_options({}, first_layout_spawn(workspace, index, tab_layout))
       )
 
       set_tab_title(new_tab, tab_snapshot.title)
-      apply_layout(new_pane, build_layout(tab_snapshot.panes or {}), workspace, index, { count = 1 })
+      apply_layout(new_pane, tab_layout, workspace, index)
     end
   end)
 
@@ -1030,7 +1107,7 @@ local function restore_workspace_in_current_window(window, pane, workspace)
   window:perform_action(
     wezterm.action.SwitchToWorkspace {
       name = workspace.name,
-      spawn = workspace_tmux_pane_spawn(workspace, 1, 1),
+      spawn = first_layout_spawn(workspace, 1, build_tab_layout(first_tab)),
     },
     pane
   )
@@ -1152,6 +1229,19 @@ function M.split_tmux_pane(window, pane, direction)
   if not ok then
     append_debug('tmux split failed: ' .. tostring(err))
     notify_error(window, 'Impossible d ouvrir un pane tmux')
+  end
+end
+
+function M.spawn_tmux_tab(window)
+  local mux_window = window:mux_window()
+  local spawn = tmux_tab_spawn(window)
+  local ok, err = pcall(function()
+    mux_window:spawn_tab(spawn)
+  end)
+
+  if not ok then
+    append_debug('tmux tab failed: ' .. tostring(err))
+    notify_error(window, 'Impossible d ouvrir un tab tmux')
   end
 end
 
