@@ -7,11 +7,18 @@ local DEFAULT_WSL_DISTRO = 'Debian'
 local DEFAULT_SSH_DOMAIN = 'tailscale-100.108.20.16'
 local DEFAULT_TMUX_SESSION = 'wezterm'
 
+local function shell_quote(value)
+    return "'" .. tostring(value):gsub("'", [['"'"']]) .. "'"
+end
+
 local function tmux_grouped_client_args(group_name)
+    local client_name = group_name .. '__wezterm_main'
     local script = table.concat({
-        'group=' .. "'" .. group_name .. "'",
-        'client="${group}__wezterm_${WEZTERM_PANE:-$$}"',
+        'group=' .. shell_quote(group_name),
+        'base=' .. shell_quote(client_name),
+        'client="$base"',
         'tmux has-session -t "$group" 2>/dev/null || tmux new-session -d -s "$group"',
+        'if tmux has-session -t "$client" 2>/dev/null && tmux list-clients -t "$client" >/dev/null 2>&1; then i=1; while tmux has-session -t "${base}_${i}" 2>/dev/null && tmux list-clients -t "${base}_${i}" >/dev/null 2>&1; do i=$((i + 1)); done; client="${base}_${i}"; fi',
         'tmux has-session -t "$client" 2>/dev/null || tmux new-session -d -t "$group" -s "$client"',
         'exec tmux attach-session -t "$client"',
     }, '; ')

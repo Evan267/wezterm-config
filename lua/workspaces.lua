@@ -244,12 +244,25 @@ local function tmux_session_name(name)
   return name
 end
 
-local function tmux_workspace_spawn(name)
+local function tmux_slot_name(slot)
+  slot = tostring(slot or 'main'):gsub('[^%w_.%-]', '_')
+
+  if slot == '' then
+    return 'main'
+  end
+
+  return slot
+end
+
+local function tmux_workspace_spawn(name, slot)
   local group = tmux_session_name(name)
+  local base = group .. '__wezterm_' .. tmux_slot_name(slot)
   local script = table.concat({
     'group=' .. bash_quote(group),
-    'client="${group}__wezterm_${WEZTERM_PANE:-$$}"',
+    'base=' .. bash_quote(base),
+    'client="$base"',
     'tmux has-session -t "$group" 2>/dev/null || tmux new-session -d -s "$group"',
+    'if tmux has-session -t "$client" 2>/dev/null && tmux list-clients -t "$client" >/dev/null 2>&1; then i=1; while tmux has-session -t "${base}_${i}" 2>/dev/null && tmux list-clients -t "${base}_${i}" >/dev/null 2>&1; do i=$((i + 1)); done; client="${base}_${i}"; fi',
     'tmux has-session -t "$client" 2>/dev/null || tmux new-session -d -t "$group" -s "$client"',
     'exec tmux attach-session -t "$client"',
   }, '; ')
@@ -581,6 +594,10 @@ local function merge_spawn_options(base, spawn)
   return base
 end
 
+local function workspace_tmux_pane_spawn(workspace, tab_index, pane_index)
+  return tmux_workspace_spawn(workspace.name, 'tab' .. tostring(tab_index) .. '_pane' .. tostring(pane_index))
+end
+
 local function focus_mux_window(mux_window)
   if not mux_window then
     return
@@ -860,7 +877,12 @@ local function build_layout(panes)
   return { kind = 'stack', panes = panes }
 end
 
-local function apply_layout(target_pane, node)
+local function next_tmux_layout_spawn(workspace, tab_index, pane_counter)
+  pane_counter.count = pane_counter.count + 1
+  return workspace_tmux_pane_spawn(workspace, tab_index, pane_counter.count)
+end
+
+local function apply_layout(target_pane, node, workspace, tab_index, pane_counter)
   if not node or node.kind == 'pane' then
     return
   end
@@ -875,8 +897,7 @@ local function apply_layout(target_pane, node)
       direction = node.direction,
       size = percent / 100,
     }
-    local second_pane = first_leaf_pane(node.second)
-    local spawn = pane_spawn(second_pane)
+    local spawn = next_tmux_layout_spawn(workspace, tab_index, pane_counter)
 
     if spawn then
       for key, value in pairs(spawn) do
@@ -885,15 +906,15 @@ local function apply_layout(target_pane, node)
     end
 
     local new_pane = target_pane:split(split_args)
-    apply_layout(target_pane, node.first)
-    apply_layout(new_pane, node.second)
+    apply_layout(target_pane, node.first, workspace, tab_index, pane_counter)
+    apply_layout(new_pane, node.second, workspace, tab_index, pane_counter)
     return
   end
 
   if node.kind == 'stack' then
     for index = 2, #node.panes do
       local split_args = { direction = 'Bottom', size = 0.5 }
-      local spawn = pane_spawn(node.panes[index])
+      local spawn = next_tmux_layout_spawn(workspace, tab_index, pane_counter)
 
       if spawn then
         for key, value in pairs(spawn) do
@@ -911,7 +932,7 @@ local function restore_workspace_in_new_window(window, pane, workspace)
   local ok, first_mux_tab, first_mux_pane, mux_window = pcall(function()
     return wezterm.mux.spawn_window(merge_spawn_options({
       position = { origin = 'ActiveScreen', x = 80, y = 80 },
-    }, pane_spawn(first_pane(first_tab)) or { cwd = workspace.cwd }))
+    }, workspace_tmux_pane_spawn(workspace, 1, 1)))
   end)
 
   if not ok or not mux_window then
@@ -924,7 +945,7 @@ local function restore_workspace_in_new_window(window, pane, workspace)
   set_tab_title(first_mux_tab, first_tab.title)
 
   local layout_ok, layout_err = pcall(function()
-    apply_layout(first_mux_pane, build_layout(first_tab.panes or {}))
+    apply_layout(first_mux_pane, build_layout(first_tab.panes or {}), workspace, 1, { count = 1 })
   end)
 
   if not layout_ok then
@@ -934,13 +955,13 @@ local function restore_workspace_in_new_window(window, pane, workspace)
   for index = 2, #workspace.tabs do
     local tab_snapshot = workspace.tabs[index]
     local new_tab, new_pane = mux_window:spawn_tab(
-      merge_spawn_options({}, pane_spawn(first_pane(tab_snapshot)) or { cwd = workspace.cwd })
+      merge_spawn_options({}, workspace_tmux_pane_spawn(workspace, index, 1))
     )
 
     set_tab_title(new_tab, tab_snapshot.title)
 
     pcall(function()
-      apply_layout(new_pane, build_layout(tab_snapshot.panes or {}))
+      apply_layout(new_pane, build_layout(tab_snapshot.panes or {}), workspace, index, { count = 1 })
     end)
   end
 
@@ -962,16 +983,16 @@ local function restore_layout_in_current_window(window, workspace)
     local first_mux_pane = mux_window:active_pane()
     set_tab_title(mux_window:active_tab(), first_tab.title)
 
-    apply_layout(first_mux_pane, build_layout(first_tab.panes or {}))
+    apply_layout(first_mux_pane, build_layout(first_tab.panes or {}), workspace, 1, { count = 1 })
 
     for index = 2, #workspace.tabs do
       local tab_snapshot = workspace.tabs[index]
       local new_tab, new_pane = mux_window:spawn_tab(
-        merge_spawn_options({}, pane_spawn(first_pane(tab_snapshot)) or { cwd = workspace.cwd })
+        merge_spawn_options({}, workspace_tmux_pane_spawn(workspace, index, 1))
       )
 
       set_tab_title(new_tab, tab_snapshot.title)
-      apply_layout(new_pane, build_layout(tab_snapshot.panes or {}))
+      apply_layout(new_pane, build_layout(tab_snapshot.panes or {}), workspace, index, { count = 1 })
     end
   end)
 
@@ -987,7 +1008,7 @@ local function restore_workspace_in_current_window(window, pane, workspace)
   window:perform_action(
     wezterm.action.SwitchToWorkspace {
       name = workspace.name,
-      spawn = pane_spawn(first_pane(first_tab)) or { cwd = workspace.cwd },
+      spawn = workspace_tmux_pane_spawn(workspace, 1, 1),
     },
     pane
   )
@@ -1017,7 +1038,7 @@ local function restore_workspace(window, pane, workspace, mode)
     end
 
     local args = {}
-    local spawn = pane_spawn(workspace)
+    local spawn = tmux_workspace_spawn(workspace.name, 'tab1_pane1')
 
     if spawn then
       for key, value in pairs(spawn) do
@@ -1050,7 +1071,7 @@ local function restore_workspace(window, pane, workspace, mode)
   if type(workspace.tabs) ~= 'table' or #workspace.tabs == 0 then
     append_debug('restore legacy workspace name=' .. tostring(workspace.name))
     local args = { name = workspace.name }
-    local spawn = pane_spawn(workspace) or tmux_workspace_spawn(workspace.name)
+    local spawn = tmux_workspace_spawn(workspace.name, 'tab1_pane1')
 
     if spawn then
       args.spawn = spawn
@@ -1083,7 +1104,7 @@ function M.prompt_new_workspace(window, pane)
         if line and line ~= '' then
           win:perform_action(wezterm.action.SwitchToWorkspace {
             name = line,
-            spawn = tmux_workspace_spawn(line),
+            spawn = tmux_workspace_spawn(line, 'tab1_pane1'),
           }, p)
         end
       end),
