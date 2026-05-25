@@ -56,11 +56,39 @@ local function tab_title(tab)
   return pane_title(tab.active_pane)
 end
 
+local function active_workspace(window)
+  local ok, name = pcall(function()
+    return window:active_workspace()
+  end)
+
+  if ok and name and name ~= '' then
+    return name
+  end
+
+  return 'default'
+end
+
 function M.apply(config)
   config.use_fancy_tab_bar = false
   config.hide_tab_bar_if_only_one_tab = false
   config.tab_bar_at_bottom = false
   config.show_new_tab_button_in_tab_bar = false
+
+  wezterm.on('update-status', function(window)
+    local overrides = window:effective_config()
+    local c = colors_for_scheme(overrides.color_scheme)
+    local workspace = active_workspace(window)
+
+    window:set_left_status(wezterm.format {
+      { Background = { Color = c.edge } },
+      { Foreground = { Color = c.accent } },
+      { Attribute = { Intensity = 'Bold' } },
+      { Text = ' WS ' },
+      { Foreground = { Color = c.fg } },
+      { Attribute = { Intensity = 'Normal' } },
+      { Text = workspace .. ' ' },
+    })
+  end)
 
   wezterm.on('format-tab-title', function(tab, _, _, config_, _, max_width)
     local c = colors_for_scheme(config_.color_scheme)
