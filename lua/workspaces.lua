@@ -245,8 +245,17 @@ local function tmux_session_name(name)
 end
 
 local function tmux_workspace_spawn(name)
+  local group = tmux_session_name(name)
+  local script = table.concat({
+    'group=' .. bash_quote(group),
+    'client="${group}__wezterm_${WEZTERM_PANE:-$$}"',
+    'tmux has-session -t "$group" 2>/dev/null || tmux new-session -d -s "$group"',
+    'tmux has-session -t "$client" 2>/dev/null || tmux new-session -d -t "$group" -s "$client"',
+    'exec tmux attach-session -t "$client"',
+  }, '; ')
+
   return {
-    args = { 'tmux', 'new-session', '-A', '-s', tmux_session_name(name) },
+    args = { 'sh', '-lc', script },
   }
 end
 

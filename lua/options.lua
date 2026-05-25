@@ -7,6 +7,18 @@ local DEFAULT_WSL_DISTRO = 'Debian'
 local DEFAULT_SSH_DOMAIN = 'tailscale-100.108.20.16'
 local DEFAULT_TMUX_SESSION = 'wezterm'
 
+local function tmux_grouped_client_args(group_name)
+    local script = table.concat({
+        'group=' .. "'" .. group_name .. "'",
+        'client="${group}__wezterm_${WEZTERM_PANE:-$$}"',
+        'tmux has-session -t "$group" 2>/dev/null || tmux new-session -d -s "$group"',
+        'tmux has-session -t "$client" 2>/dev/null || tmux new-session -d -t "$group" -s "$client"',
+        'exec tmux attach-session -t "$client"',
+    }, '; ')
+
+    return { 'sh', '-lc', script }
+end
+
 local function is_windows()
     return wezterm.target_triple:find('windows') ~= nil
 end
@@ -130,7 +142,7 @@ function M.apply(config)
             remote_address = '100.108.20.16',
             username = 'evan',
             multiplexing = 'None',
-            default_prog = { 'tmux', 'new-session', '-A', '-s', DEFAULT_TMUX_SESSION },
+            default_prog = tmux_grouped_client_args(DEFAULT_TMUX_SESSION),
         },
     }
     config.default_domain = DEFAULT_SSH_DOMAIN
