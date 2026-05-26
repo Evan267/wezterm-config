@@ -265,10 +265,8 @@ local function tmux_workspace_spawn(name, slot, options)
   local group = tmux_session_name(name)
   local base = group .. '__wezterm_' .. tmux_slot_name(slot)
   local commands = {
-    'group=' .. bash_quote(group),
     'base=' .. bash_quote(base),
     'client="$base"',
-    'tmux has-session -t "$group" 2>/dev/null || tmux new-session -d -s "$group"',
   }
 
   if options.replace_slot then
@@ -279,10 +277,10 @@ local function tmux_workspace_spawn(name, slot, options)
   end
 
   table.insert(commands,
-    'if tmux has-session -t "$client" 2>/dev/null && tmux list-clients -t "$client" >/dev/null 2>&1; then i=1; while tmux has-session -t "${base}_${i}" 2>/dev/null && tmux list-clients -t "${base}_${i}" >/dev/null 2>&1; do i=$((i + 1)); done; client="${base}_${i}"; fi'
+    'if tmux has-session -t "$client" 2>/dev/null && tmux list-clients -t "$client" >/dev/null 2>&1; then tmux kill-session -t "$client"; fi'
   )
   table.insert(commands,
-    'tmux has-session -t "$client" 2>/dev/null || tmux new-session -d -t "$group" -s "$client"'
+    'tmux has-session -t "$client" 2>/dev/null || tmux new-session -d -s "$client"'
   )
   table.insert(commands,
     'exec tmux attach-session -t "$client"'
@@ -296,9 +294,7 @@ local function tmux_workspace_spawn(name, slot, options)
 end
 
 local function normal_shell_spawn()
-  return {
-    args = { 'sh', '-l' },
-  }
+  return { args = { 'bash', '-l', '-i' } }
 end
 
 local function ssh_command()

@@ -149,7 +149,6 @@ function M.apply(config)
             remote_address = '100.108.20.16',
             username = 'evan',
             multiplexing = 'None',
-            default_prog = tmux_grouped_client_args(DEFAULT_TMUX_SESSION),
         },
     }
     config.default_domain = DEFAULT_SSH_DOMAIN
