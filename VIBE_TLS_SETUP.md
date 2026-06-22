@@ -136,8 +136,13 @@ node -e "require('tls').createSecureContext({}); console.log('CA chargees OK')"
 node -e "require('https').get('https://registry.npmjs.org/',r=>{console.log(r.statusCode);r.destroy()}).on('error',e=>console.error(e.message))"
 ```
 
-La variable persistante (`User`) ne prend effet que dans les **nouveaux**
-process : ré-ouvrir les panes / le workspace pour que tout en hérite.
+**Prise en compte dans les panes.** Le `wezterm-mux-server`, démarré avant la
+pose de la variable, ne la transmet pas à ses panes (environnement figé). Plutôt
+que de le redémarrer (ce qui tue les panes vifs), `shell/pwsh-workspace-tracker.ps1`
+**repose la variable dans chaque pane** au démarrage du shell (si
+`~\node-extra-ca.pem` existe et que la variable n'est pas déjà définie). Il
+suffit donc de **ré-ouvrir le workspace** pour que les outils Node en héritent ;
+inutile de toucher au mux-server.
 
 > Alternative si Node ≥ 22 sur vibe : `NODE_OPTIONS=--use-system-ca` (Node lit
 > directement le magasin Windows, sans fichier à maintenir).

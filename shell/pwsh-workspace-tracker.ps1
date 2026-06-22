@@ -10,6 +10,15 @@
 #   notepad $PROFILE
 #   . "$HOME\.config\wezterm\shell\pwsh-workspace-tracker.ps1"
 
+# Fait confiance a la CA du proxy Fortinet pour les outils Node lances dans les
+# panes (claude, npm, dev servers...). Le fichier est genere une seule fois sur
+# vibe (cf. VIBE_TLS_SETUP.md, section « CA du proxy »). On l'expose ici car le
+# mux-server, demarre avant la pose de la variable persistante, ne la transmet
+# pas a ses panes : chaque shell la repose donc lui-meme, avant la 1ere commande.
+if (-not $env:NODE_EXTRA_CA_CERTS -and (Test-Path "$HOME\node-extra-ca.pem")) {
+  $env:NODE_EXTRA_CA_CERTS = "$HOME\node-extra-ca.pem"
+}
+
 $global:__WeztermWorkspaceLastCommand = ''
 
 function global:__WeztermWorkspaceSetUserVar {
