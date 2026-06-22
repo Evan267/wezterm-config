@@ -84,6 +84,64 @@ couperait `C:\Program Files\...` à l'espace).
   wezterm cli list
   ```
 
+## CA du proxy pour les outils Node (panes vibe)
+
+Indépendant du mux TLS, mais à régler **sur vibe** car les panes y tournent
+(`default_domain = vibe`). Le réseau THK passe par un proxy Fortinet qui fait de
+l'inspection SSL : les outils **Node** (claude, npm, dev servers…) doivent faire
+confiance à sa CA, sinon ils échouent en HTTPS ou polluent l'ouverture de
+workspace.
+
+**Symptôme** à l'ouverture d'un workspace :
+
+```
+Warning: Ignoring extra certs from C:\Users\eberger\certificat.pem, load failed:
+error:10000002:SSL routines:OPENSSL_internal:system library
+```
+
+C'est **Node** (pas WezTerm) : `NODE_EXTRA_CA_CERTS` pointe vers un PEM absent ou
+non définie sur vibe → Node ne charge pas la CA. En local la variable est déjà
+posée et valide ; le seul trou est vibe.
+
+**Correctif (dans un pane vibe, une seule fois).** On extrait les CA directement
+du magasin Windows de vibe (machine du domaine → CA déjà présentes), ce qui
+garantit un PEM propre :
+
+```powershell
+$out = "$HOME\node-extra-ca.pem"
+Get-ChildItem Cert:\LocalMachine\Root, Cert:\CurrentUser\Root |
+  Where-Object { $_.Subject -match 'Fortinet|THK-CA' } |
+  Sort-Object Thumbprint -Unique |
+  ForEach-Object {
+    "-----BEGIN CERTIFICATE-----"
+    [Convert]::ToBase64String($_.RawData,'InsertLineBreaks')
+    "-----END CERTIFICATE-----"
+  } | Set-Content -Encoding ascii $out
+
+[Environment]::SetEnvironmentVariable('NODE_EXTRA_CA_CERTS', $out, 'User')
+$env:NODE_EXTRA_CA_CERTS = $out
+```
+
+Les deux CA attendues : `FGT80FTK2000xxxx` (proxy Fortinet, indispensable) et
+`THK-CA` (racine AD interne). Si le compteur de `BEGIN CERTIFICATE` est à 0,
+ajuster le `-match` après `Get-ChildItem Cert:\LocalMachine\Root | Where Subject
+-match 'Fortinet'`.
+
+**Vérification :**
+
+```powershell
+# doit afficher "OK" SANS warning "ignoring extra certs"
+node -e "require('tls').createSecureContext({}); console.log('CA chargees OK')"
+# test reel a travers le proxy : status 200 attendu, aucune erreur de cert
+node -e "require('https').get('https://registry.npmjs.org/',r=>{console.log(r.statusCode);r.destroy()}).on('error',e=>console.error(e.message))"
+```
+
+La variable persistante (`User`) ne prend effet que dans les **nouveaux**
+process : ré-ouvrir les panes / le workspace pour que tout en hérite.
+
+> Alternative si Node ≥ 22 sur vibe : `NODE_OPTIONS=--use-system-ca` (Node lit
+> directement le magasin Windows, sans fichier à maintenir).
+
 ## Dépannage
 
 - **Mismatch de hostname sur le certificat** au bootstrap → décommenter
