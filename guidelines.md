@@ -88,3 +88,9 @@ Avant de considerer une modification terminee :
 - Les plugins WezTerm peuvent necessiter un acces reseau au premier chargement.
 - Les raccourcis documentes ne sont fiables que si `lua/keys.lua` est effectivement applique dans `wezterm.lua`.
 - Eviter de reintroduire un plugin de persistance de session sans validation specifique sous Windows.
+- Detection du theme clair/sombre (`lua/options.lua`) : utiliser l'API native
+  `window:get_appearance()` / `wezterm.gui.get_appearance()`. Ne PAS revenir a une
+  detection via `reg.exe` : le handler `update-status` tourne toutes les 1000 ms et
+  un appel `wezterm.run_child_process` y est synchrone sur le thread GUI (~36 ms a
+  chaque tick), ce qui rend l'interface moins reactive (jitter a l'ouverture d'un
+  pane inclus).

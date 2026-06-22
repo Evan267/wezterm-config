@@ -1,15 +1,10 @@
 local wezterm = require 'wezterm'
 local M = {}
 
-local DYNAMIC_COLOR_SCHEME_EVENT_VERSION = 5
-local WINDOWS_THEME_REG_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize'
+local DYNAMIC_COLOR_SCHEME_EVENT_VERSION = 6
 local VIBE_DOMAIN = 'vibe'
 local VIBE_HOST = 'WS871674'   -- hostname de la machine vibe (mux-server)
 local VIBE_TLS_PORT = 8131     -- port d'ecoute TLS du wezterm-mux-server sur vibe
-
-local function is_windows()
-    return wezterm.target_triple:find('windows') ~= nil
-end
 
 local function color_scheme_for_appearance(appearance)
     appearance = appearance or 'Dark'
@@ -21,52 +16,13 @@ local function color_scheme_for_appearance(appearance)
     return 'Catppuccin Latte'
 end
 
-local function color_scheme_from_windows_registry()
-    if not is_windows() then
-        return nil
-    end
-
-    local ok, first, second, third = pcall(wezterm.run_child_process, {
-        'reg.exe',
-        'query',
-        WINDOWS_THEME_REG_KEY,
-        '/v',
-        'AppsUseLightTheme',
-    })
-
-    if not ok then
-        return nil
-    end
-
-    local output = nil
-
-    for _, value in ipairs({ first, second, third }) do
-        if type(value) == 'string' and value:find('AppsUseLightTheme') then
-            output = value
-            break
-        end
-    end
-
-    if not output then
-        return nil
-    end
-
-    if output:find('0x0') then
-        return color_scheme_for_appearance('Dark')
-    end
-
-    if output:find('0x1') then
-        return color_scheme_for_appearance('Light')
-    end
-
-    return nil
-end
-
+-- Detection du theme clair/sombre via l'API native WezTerm (supportee sur
+-- Windows depuis 2023). On NE lance PLUS reg.exe : l'ancien code le faisait a
+-- chaque update-status (toutes les 1000 ms) de facon SYNCHRONE sur le thread
+-- GUI (~36 ms a chaque fois), ce qui ajoutait du jitter a toute l'interface,
+-- y compris au moment d'ouvrir un pane. window:get_appearance() est un appel
+-- natif sans process enfant ; le basculement auto clair/sombre reste actif.
 local function current_color_scheme(window)
-    if is_windows() then
-        return color_scheme_from_windows_registry()
-    end
-
     if window then
         return color_scheme_for_appearance(window:get_appearance())
     end
