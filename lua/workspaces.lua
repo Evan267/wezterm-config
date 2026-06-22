@@ -4,8 +4,6 @@ local M = {}
 local registry_path = wezterm.config_dir .. '/workspaces.json'
 local debug_path = wezterm.config_dir .. '/workspaces-debug.log'
 local snapshot_version = 1
-local default_wsl_distro = 'Debian'
-local remote_ssh_target = 'evan@100.108.20.16'
 local notification_duration = 2500
 local error_notification_duration = 5000
 local notification_serial = 0
@@ -184,177 +182,29 @@ local function live_workspace_name(name)
   return canonical_workspace_name(name) .. ' live ' .. os.date('%H%M%S')
 end
 
-local function is_windows()
-  return wezterm.target_triple:find('windows') ~= nil
-end
-
-local function wsl_distro()
-  return wezterm.GLOBAL.wsl_distro or default_wsl_distro
-end
-
-local function windows_path_to_wsl(path)
-  if type(path) ~= 'string' then
-    return path
-  end
-
-  if not is_windows() then
-    return path
-  end
-
-  local drive, rest = path:match('^/([A-Za-z]):[/\\]?(.*)$')
-
-  if not drive then
-    drive, rest = path:match('^([A-Za-z]):[/\\]?(.*)$')
-  end
-
-  if not drive then
-    return path
-  end
-
-  rest = (rest or ''):gsub('\\', '/')
-  return '/mnt/' .. drive:lower() .. (rest ~= '' and '/' .. rest or '')
-end
-
-local function bash_quote(value)
-  return "'" .. tostring(value):gsub("'", [['"'"']]) .. "'"
-end
-
-local function shell_init_file()
-  return windows_path_to_wsl(wezterm.config_dir .. '/shell/bash-workspace-tracker.bash')
-end
-
-local function shell_command_args(command)
-  return {
-    'bash',
-    '--init-file',
-    shell_init_file(),
-    '-i',
-    '-c',
-    command .. '\nexec bash --init-file ' .. bash_quote(shell_init_file()) .. ' -i',
-  }
-end
-
-local function tmux_session_name(name)
-  name = canonical_workspace_name(name or 'default')
-  name = name:gsub('[^%w_.%-]', '_')
-
-  if name == '' then
-    return 'default'
-  end
-
-  return name
-end
-
-local function is_named_workspace(name)
-  name = canonical_workspace_name(name)
-  return name ~= '' and name ~= 'default'
-end
-
-local function tmux_slot_name(slot)
-  slot = tostring(slot or 'main'):gsub('[^%w_.%-]', '_')
-
-  if slot == '' then
-    return 'main'
-  end
-
-  return slot
-end
-
-local function tmux_workspace_spawn(name, slot, options)
-  options = options or {}
-  local group = tmux_session_name(name)
-  local base = group .. '__wezterm_' .. tmux_slot_name(slot)
-  local commands = {
-    'base=' .. bash_quote(base),
-    'client="$base"',
-  }
-
-  if options.replace_slot then
-    table.insert(
-      commands,
-      'tmux list-sessions -F "#{session_name}" 2>/dev/null | while IFS= read -r session; do case "$session" in "$base"|"$base"_*) tmux kill-session -t "$session" ;; esac; done'
-    )
-  end
-
-  table.insert(commands,
-    'if tmux has-session -t "$client" 2>/dev/null && tmux list-clients -t "$client" >/dev/null 2>&1; then tmux kill-session -t "$client"; fi'
-  )
-  table.insert(commands,
-    'tmux has-session -t "$client" 2>/dev/null || tmux new-session -d -s "$client"'
-  )
-  table.insert(commands,
-    'exec tmux attach-session -t "$client"'
-  )
-
-  local script = table.concat(commands, '; ')
-
-  return {
-    args = { 'sh', '-lc', script },
-  }
-end
-
-local function normal_shell_spawn()
-  return { args = { 'bash', '-l', '-i' } }
-end
-
-local function ssh_command()
-  if wezterm.target_triple:find('windows') ~= nil then
-    return 'ssh.exe'
-  end
-
-  return 'ssh'
-end
-
-local function kill_workspace_tmux_sessions(name)
-  if not is_named_workspace(name) then
-    return true
-  end
-
-  local group = tmux_session_name(name)
-  local script = table.concat({
-    'group=' .. bash_quote(group),
-    'tmux list-sessions -F "#{session_name}" 2>/dev/null | while IFS= read -r session; do case "$session" in "$group"|"$group"__wezterm_*) tmux kill-session -t "$session" ;; esac; done',
-  }, '; ')
-
-  local ok, success, stdout, stderr = pcall(function()
-    return wezterm.run_child_process({ ssh_command(), remote_ssh_target, 'sh -lc ' .. bash_quote(script) })
-  end)
-
-  if ok and success == true then
-    return true
-  end
-
-  append_debug(
-    'tmux cleanup failed name=' .. tostring(name)
-      .. ' ok=' .. tostring(ok)
-      .. ' success=' .. tostring(success)
-      .. ' stdout=' .. tostring(stdout)
-      .. ' stderr=' .. tostring(stderr)
-  )
-  return false
-end
-
-local function path_exists(path)
+-- Normalise un chemin de travail remonte par un pane distant Windows
+-- (ex: 'file://host/C:/Users/x', '/C:/Users/x') vers une forme Windows 'C:\Users\x'.
+local function normalize_remote_path(path)
   if type(path) ~= 'string' or path == '' then
-    return false
+    return path
   end
 
-  local ok, success = pcall(function()
-    return wezterm.run_child_process({ 'test', '-d', path })
-  end)
+  path = path:gsub('^file://[^/]*', '')
 
-  if ok and success == true then
-    return true
+  local drive_rest = path:match('^/([A-Za-z]:.*)$')
+
+  if drive_rest then
+    path = drive_rest
   end
 
-  return false
+  return (path:gsub('/', '\\'))
 end
 
 local function current_working_dir(pane)
   local cwd = pane:get_current_working_dir()
 
   if type(cwd) == 'userdata' and (not cwd.scheme or cwd.scheme == 'file') and cwd.file_path then
-    return windows_path_to_wsl(cwd.file_path)
+    return normalize_remote_path(cwd.file_path)
   end
 
   if type(cwd) == 'string' then
@@ -365,10 +215,10 @@ local function current_working_dir(pane)
     end
 
     if ok and parsed and (not parsed.scheme or parsed.scheme == 'file') and parsed.file_path then
-      return windows_path_to_wsl(parsed.file_path)
+      return normalize_remote_path(parsed.file_path)
     end
 
-    return windows_path_to_wsl(cwd:gsub('^file://', ''))
+    return normalize_remote_path(cwd:gsub('^file://', ''))
   end
 
   return nil
@@ -494,7 +344,7 @@ local function cwd_from_title(title)
   cwd = cwd:gsub('%s+$', '')
 
   if cwd:match('^~/') or cwd:match('^/') or cwd:match('^[A-Za-z]:[/\\]') then
-    return windows_path_to_wsl(cwd)
+    return normalize_remote_path(cwd)
   end
 
   return nil
@@ -562,7 +412,7 @@ local function pane_spawn(pane_snapshot)
     return nil
   end
 
-  local cwd = windows_path_to_wsl(pane_snapshot.cwd)
+  local cwd = normalize_remote_path(pane_snapshot.cwd)
   local argv = copy_array(pane_snapshot.argv)
   local command = type(pane_snapshot.last_command) == 'string' and pane_snapshot.last_command or nil
   local spawn = {}
@@ -575,38 +425,14 @@ local function pane_spawn(pane_snapshot)
     command = nil
   end
 
-  if cwd and cwd ~= '' then
-    if not is_windows() and cwd:match('^/mnt/[A-Za-z]/') and not path_exists(cwd) then
-      cwd = nil
-    end
-  end
-
-  if cwd and cwd ~= '' then
-    if is_windows() and cwd:match('^/') and not cwd:match('^//') then
-      local args = { 'wsl.exe', '-d', wsl_distro(), '--cd', cwd }
-
-      if command then
-        table.insert(args, '--')
-        for _, arg in ipairs(shell_command_args(command)) do
-          table.insert(args, arg)
-        end
-      elseif argv and not is_shell(argv) then
-        table.insert(args, '--')
-
-        for _, arg in ipairs(argv) do
-          table.insert(args, arg)
-        end
-      end
-
-      spawn.args = args
-      return spawn
-    end
-
+  if type(cwd) == 'string' and cwd ~= '' then
     spawn.cwd = cwd
   end
 
   if command then
-    spawn.args = shell_command_args(command)
+    -- relance la derniere commande puis garde un shell interactif (le profil
+    -- Windows PowerShell de vibe charge le workspace tracker)
+    spawn.args = { 'powershell.exe', '-NoExit', '-Command', command }
   elseif argv and not is_shell(argv) then
     spawn.args = argv
   end
@@ -654,77 +480,6 @@ local function merge_spawn_options(base, spawn)
   end
 
   return base
-end
-
-local function workspace_tmux_pane_spawn(workspace, tab_index, pane_index)
-  return tmux_workspace_spawn(workspace.name, 'tab' .. tostring(tab_index) .. '_pane' .. tostring(pane_index))
-end
-
-local function active_tab_index(window)
-  local mux_window = window:mux_window()
-  local ok, tabs = pcall(function()
-    return mux_window:tabs_with_info()
-  end)
-
-  if ok and type(tabs) == 'table' then
-    for index, item in ipairs(tabs) do
-      if item.is_active then
-        return index
-      end
-    end
-  end
-
-  return 1
-end
-
-local function tab_count(window)
-  local mux_window = window:mux_window()
-  local ok, tabs = pcall(function()
-    return mux_window:tabs()
-  end)
-
-  if ok and type(tabs) == 'table' then
-    return #tabs
-  end
-
-  ok, tabs = pcall(function()
-    return mux_window:tabs_with_info()
-  end)
-
-  if ok and type(tabs) == 'table' then
-    return #tabs
-  end
-
-  return 1
-end
-
-local function active_tab_pane_count(window)
-  local tab = active_tab(window)
-  local ok, panes = pcall(function()
-    return tab:panes_with_info()
-  end)
-
-  if ok and type(panes) == 'table' then
-    return #panes
-  end
-
-  return 1
-end
-
-local function tmux_split_spawn(window)
-  return tmux_workspace_spawn(
-    workspace_name(window),
-    'tab' .. tostring(active_tab_index(window)) .. '_pane' .. tostring(active_tab_pane_count(window) + 1),
-    { replace_slot = true }
-  )
-end
-
-local function tmux_tab_spawn(window)
-  return tmux_workspace_spawn(
-    workspace_name(window),
-    'tab' .. tostring(tab_count(window) + 1) .. '_pane1',
-    { replace_slot = true }
-  )
 end
 
 local function focus_mux_window(mux_window)
@@ -1013,32 +768,25 @@ local function build_tab_layout(tab_snapshot)
     return nil
   end
 
-  for index, pane in ipairs(tab_snapshot.panes) do
+  for _, pane in ipairs(tab_snapshot.panes) do
     local copy = {}
 
     for key, value in pairs(pane) do
       copy[key] = value
     end
 
-    copy.tmux_pane_index = index
     table.insert(panes, copy)
   end
 
   return build_layout(panes)
 end
 
-local function tmux_layout_spawn(workspace, tab_index, pane_snapshot)
-  local pane_index = type(pane_snapshot) == 'table' and pane_snapshot.tmux_pane_index or nil
-
-  if not pane_index then
-    return tmux_workspace_spawn(workspace.name, 'tab' .. tostring(tab_index) .. '_pane_extra')
-  end
-
-  return workspace_tmux_pane_spawn(workspace, tab_index, pane_index)
+local function layout_pane_spawn(pane_snapshot)
+  return pane_spawn(pane_snapshot)
 end
 
-local function first_layout_spawn(workspace, tab_index, layout)
-  return tmux_layout_spawn(workspace, tab_index, first_leaf_pane(layout))
+local function first_layout_spawn(_, _, layout)
+  return layout_pane_spawn(first_leaf_pane(layout))
 end
 
 local function apply_layout(target_pane, node, workspace, tab_index)
@@ -1056,7 +804,7 @@ local function apply_layout(target_pane, node, workspace, tab_index)
       direction = node.direction,
       size = percent / 100,
     }
-    local spawn = tmux_layout_spawn(workspace, tab_index, first_leaf_pane(node.second))
+    local spawn = layout_pane_spawn(first_leaf_pane(node.second))
 
     if spawn then
       for key, value in pairs(spawn) do
@@ -1073,7 +821,7 @@ local function apply_layout(target_pane, node, workspace, tab_index)
   if node.kind == 'stack' then
     for index = 2, #node.panes do
       local split_args = { direction = 'Bottom', size = 0.5 }
-      local spawn = tmux_layout_spawn(workspace, tab_index, node.panes[index])
+      local spawn = layout_pane_spawn(node.panes[index])
 
       if spawn then
         for key, value in pairs(spawn) do
@@ -1165,6 +913,35 @@ local function restore_layout_in_current_window(window, workspace)
   end
 end
 
+-- Le SwitchToWorkspace n'est pas synchrone: la fenetre peut encore reporter
+-- l'ancien workspace pendant quelques dizaines de ms. On re-essaie jusqu'a ce que
+-- le workspace cible soit actif, au lieu de skipper le layout (ancien bug).
+local function restore_layout_when_ready(window, workspace, attempts)
+  attempts = attempts or 0
+
+  local ok, current = pcall(function()
+    return window:mux_window():get_workspace()
+  end)
+
+  if ok and current == workspace.name then
+    restore_layout_in_current_window(window, workspace)
+    return
+  end
+
+  if attempts >= 30 then
+    append_debug('restore layout gave up workspace=' .. tostring(current))
+    return
+  end
+
+  if wezterm.time and wezterm.time.call_after then
+    wezterm.time.call_after(0.1, function()
+      restore_layout_when_ready(window, workspace, attempts + 1)
+    end)
+  else
+    restore_layout_in_current_window(window, workspace)
+  end
+end
+
 local function restore_workspace_in_current_window(window, pane, workspace)
   local first_tab = workspace.tabs[1]
 
@@ -1176,13 +953,7 @@ local function restore_workspace_in_current_window(window, pane, workspace)
     pane
   )
 
-  if wezterm.time and wezterm.time.call_after then
-    wezterm.time.call_after(0.1, function()
-      restore_layout_in_current_window(window, workspace)
-    end)
-  else
-    restore_layout_in_current_window(window, workspace)
-  end
+  restore_layout_when_ready(window, workspace)
 
   return true
 end
@@ -1200,17 +971,8 @@ local function restore_workspace(window, pane, workspace, mode)
       return
     end
 
-    local args = {}
-    local spawn = tmux_workspace_spawn(workspace.name, 'tab1_pane1')
-
-    if spawn then
-      for key, value in pairs(spawn) do
-        args[key] = value
-      end
-    end
-
     local ok, err = pcall(function()
-      wezterm.mux.spawn_window(args)
+      wezterm.mux.spawn_window({})
     end)
 
     if ok then
@@ -1233,14 +995,7 @@ local function restore_workspace(window, pane, workspace, mode)
 
   if type(workspace.tabs) ~= 'table' or #workspace.tabs == 0 then
     append_debug('restore legacy workspace name=' .. tostring(workspace.name))
-    local args = { name = workspace.name }
-    local spawn = tmux_workspace_spawn(workspace.name, 'tab1_pane1')
-
-    if spawn then
-      args.spawn = spawn
-    end
-
-    window:perform_action(wezterm.action.SwitchToWorkspace(args), pane)
+    window:perform_action(wezterm.action.SwitchToWorkspace { name = workspace.name }, pane)
     return
   end
 
@@ -1267,7 +1022,6 @@ function M.prompt_new_workspace(window, pane)
         if line and line ~= '' then
           win:perform_action(wezterm.action.SwitchToWorkspace {
             name = line,
-            spawn = tmux_workspace_spawn(line, 'tab1_pane1'),
           }, p)
         end
       end),
@@ -1276,36 +1030,28 @@ function M.prompt_new_workspace(window, pane)
   )
 end
 
-function M.split_tmux_pane(window, pane, direction)
-  local split_args = {
-    direction = direction,
-  }
-  local spawn = is_named_workspace(workspace_name(window)) and tmux_split_spawn(window) or normal_shell_spawn()
-
-  for key, value in pairs(spawn) do
-    split_args[key] = value
-  end
-
+function M.split_pane(window, pane, direction)
+  -- Spawn natif dans le domaine courant (mux-server vibe): la persistance est
+  -- assuree cote serveur, plus besoin de session tmux.
   local ok, err = pcall(function()
-    pane:split(split_args)
+    pane:split { direction = direction }
   end)
 
   if not ok then
-    append_debug('tmux split failed: ' .. tostring(err))
-    notify_error(window, 'Impossible d ouvrir un pane tmux')
+    append_debug('split failed: ' .. tostring(err))
+    notify_error(window, 'Impossible d ouvrir un pane')
   end
 end
 
-function M.spawn_tmux_tab(window)
+function M.spawn_tab(window)
   local mux_window = window:mux_window()
-  local spawn = is_named_workspace(workspace_name(window)) and tmux_tab_spawn(window) or normal_shell_spawn()
   local ok, err = pcall(function()
-    mux_window:spawn_tab(spawn)
+    mux_window:spawn_tab {}
   end)
 
   if not ok then
-    append_debug('tmux tab failed: ' .. tostring(err))
-    notify_error(window, 'Impossible d ouvrir un tab tmux')
+    append_debug('spawn tab failed: ' .. tostring(err))
+    notify_error(window, 'Impossible d ouvrir un tab')
   end
 end
 
@@ -1470,11 +1216,7 @@ function M.choose_delete_registered(window, pane)
 
         if ok and removed then
           append_debug('delete workspace name=' .. tostring(name))
-          if kill_workspace_tmux_sessions(name) then
-            notify(win, 'Workspace supprime: ' .. name)
-          else
-            notify_error(win, 'Workspace supprime, tmux non nettoye: ' .. name)
-          end
+          notify(win, 'Workspace supprime: ' .. name)
         else
           append_debug('delete failed name=' .. tostring(name) .. ' err=' .. tostring(removed))
           notify_error(win, 'Impossible de supprimer: ' .. name)

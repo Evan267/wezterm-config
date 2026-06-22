@@ -42,21 +42,21 @@ function M.apply(config)
       key = 't',
       mods = 'LEADER',
       action = w.action_callback(function(window, pane)
-	workspaces.spawn_tmux_tab(window, pane)
+	workspaces.spawn_tab(window, pane)
       end),
     },
     {
       key = 'v',
       mods = 'LEADER',
       action = w.action_callback(function(window, pane)
-	workspaces.split_tmux_pane(window, pane, 'Right')
+	workspaces.split_pane(window, pane, 'Right')
       end),
     },
     {
       key = 's',
       mods = 'LEADER',
       action = w.action_callback(function(window, pane)
-	workspaces.split_tmux_pane(window, pane, 'Bottom')
+	workspaces.split_pane(window, pane, 'Bottom')
       end),
     },
     { key = 'w', mods = 'LEADER', action = w.action.CloseCurrentPane { confirm = true } },

@@ -1,0 +1,4 @@
+# Etat runtime des workspaces : regenere localement sur chaque machine
+# (poste + vibe). Ne pas versionner, sinon l'etat d'une machine ecrase l'autre.
+workspaces.json
+workspaces-debug.log

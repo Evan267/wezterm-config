@@ -3,50 +3,12 @@ local M = {}
 
 local DYNAMIC_COLOR_SCHEME_EVENT_VERSION = 5
 local WINDOWS_THEME_REG_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize'
-local DEFAULT_WSL_DISTRO = 'Debian'
-local DEFAULT_SSH_DOMAIN = 'tailscale-100.108.20.16'
-local DEFAULT_TMUX_SESSION = 'wezterm'
-
-local function shell_quote(value)
-    return "'" .. tostring(value):gsub("'", [['"'"']]) .. "'"
-end
-
-local function tmux_grouped_client_args(group_name)
-    local client_name = group_name .. '__wezterm_main'
-    local script = table.concat({
-        'group=' .. shell_quote(group_name),
-        'base=' .. shell_quote(client_name),
-        'client="$base"',
-        'tmux has-session -t "$group" 2>/dev/null || tmux new-session -d -s "$group"',
-        'if tmux has-session -t "$client" 2>/dev/null && tmux list-clients -t "$client" >/dev/null 2>&1; then i=1; while tmux has-session -t "${base}_${i}" 2>/dev/null && tmux list-clients -t "${base}_${i}" >/dev/null 2>&1; do i=$((i + 1)); done; client="${base}_${i}"; fi',
-        'tmux has-session -t "$client" 2>/dev/null || tmux new-session -d -t "$group" -s "$client"',
-        'exec tmux attach-session -t "$client"',
-    }, '; ')
-
-    return { 'sh', '-lc', script }
-end
+local VIBE_DOMAIN = 'vibe'
+local VIBE_HOST = 'WS871674'   -- hostname de la machine vibe (mux-server)
+local VIBE_TLS_PORT = 8131     -- port d'ecoute TLS du wezterm-mux-server sur vibe
 
 local function is_windows()
     return wezterm.target_triple:find('windows') ~= nil
-end
-
-local function wsl_distro()
-    return os.getenv('WEZTERM_WSL_DISTRO') or DEFAULT_WSL_DISTRO
-end
-
-local function windows_path_to_wsl(path)
-    if type(path) ~= 'string' then
-        return path
-    end
-
-    local drive, rest = path:match('^([A-Za-z]):[/\\]?(.*)$')
-
-    if not drive then
-        return path:gsub('\\', '/')
-    end
-
-    rest = (rest or ''):gsub('\\', '/')
-    return '/mnt/' .. drive:lower() .. (rest ~= '' and '/' .. rest or '')
 end
 
 local function color_scheme_for_appearance(appearance)
@@ -143,26 +105,50 @@ function M.apply(config)
     config.font = wezterm.font('JetBrains Mono')
     config.status_update_interval = 1000
     config.exit_behavior = 'Close'
-    config.ssh_domains = {
-        {
-            name = DEFAULT_SSH_DOMAIN,
-            remote_address = '100.108.20.16',
-            username = 'evan',
-            multiplexing = 'None',
-        },
-    }
-    config.default_domain = DEFAULT_SSH_DOMAIN
-    
+    -- 'vibe' = WS871674, machine distante avec wezterm-mux-server persistant.
+    -- Ce repo tourne sur les DEUX machines (cf. shell/pwsh-workspace-tracker.ps1),
+    -- donc on branche selon le hostname : serveur TLS cote vibe, client TLS cote local.
+    local is_vibe_server = wezterm.hostname() == VIBE_HOST
+
+    if is_vibe_server then
+        -- Cote serveur : exposer le mux via TLS. Au premier bootstrap SSH depuis le
+        -- client, wezterm genere et echange les certificats automatiquement.
+        -- Pre-requis cote vibe : pare-feu entrant TCP VIBE_TLS_PORT autorise.
+        config.tls_servers = {
+            {
+                bind_address = '0.0.0.0:' .. VIBE_TLS_PORT,
+            },
+        }
+    else
+        -- Cote client : domaine TLS (et non plus SSH). Le PREMIER connect bootstrap
+        -- les certs via SSH (lent, une seule fois) ; ensuite chaque connexion est une
+        -- socket TLS directe vers le mux deja vivant -> on supprime le 'Checking
+        -- server version' et le spawn d'un shell distant a chaque lancement.
+        config.tls_clients = {
+            {
+                name = VIBE_DOMAIN,
+                bootstrap_via_ssh = 'vibe',   -- resolu via ~/.ssh/config (HostName WS871674, User EBerger)
+                remote_address = VIBE_HOST .. ':' .. VIBE_TLS_PORT,
+                -- chemin court 8.3 (sans espace): le bootstrap SSH lance le wezterm
+                -- distant via cmd.exe, qui couperait "C:\Program Files\..." a l'espace.
+                remote_wezterm_path = 'C:\\PROGRA~1\\WezTerm\\wezterm.exe',
+                -- Si le bootstrap se plaint d'un mismatch de hostname sur le cert,
+                -- decommenter la ligne suivante :
+                -- accept_invalid_hostnames = true,
+            },
+        }
+        config.default_domain = VIBE_DOMAIN
+        -- Au lancement, RATTACHER le mux-server vibe existant (et ses fenetres/workspaces
+        -- deja vivants) au lieu de spawn une fenetre 'default' vide. Sans ca, le reopen
+        -- repart sur un workspace neuf et donne l'impression que les sessions sont perdues.
+        config.default_gui_startup_args = { 'connect', VIBE_DOMAIN }
+    end
+
     config.window_decorations = "RESIZE"
     config.window_background_opacity = 0.95
-    
+
     config.window_padding = { left = 5, right = 5, top = 5, bottom = 5 }
 
-    if is_windows() then
-        local distro = wsl_distro()
-        wezterm.GLOBAL.wsl_distro = distro
-    end
-    
     config.inactive_pane_hsb = {
         saturation = 0.9,
         brightness = 0.5,
