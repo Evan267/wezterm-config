@@ -1,10 +1,12 @@
 local wezterm = require 'wezterm'
+local env = require('lua/env')
 local M = {}
 
 local DYNAMIC_COLOR_SCHEME_EVENT_VERSION = 6
-local VIBE_DOMAIN = 'vibe'
-local VIBE_HOST = 'WS871674'   -- hostname de la machine vibe (mux-server)
-local VIBE_TLS_PORT = 8131     -- port d'ecoute TLS du wezterm-mux-server sur vibe
+-- Variables du domaine mux chargees depuis `.env` (cf. lua/env.lua, .env.example).
+local VIBE_DOMAIN = env.VIBE_DOMAIN     -- nom du domaine TLS cote client
+local VIBE_ADDR = env.VIBE_ADDR         -- IP de vibe : le nom court WS871674 ne resout pas toujours hors interne (VPN)
+local VIBE_TLS_PORT = env.VIBE_TLS_PORT -- port d'ecoute TLS du wezterm-mux-server sur vibe
 
 local function color_scheme_for_appearance(appearance)
     appearance = appearance or 'Dark'
@@ -61,44 +63,32 @@ function M.apply(config)
     config.font = wezterm.font('JetBrains Mono')
     config.status_update_interval = 1000
     config.exit_behavior = 'Close'
-    -- 'vibe' = WS871674, machine distante avec wezterm-mux-server persistant.
-    -- Ce repo tourne sur les DEUX machines (cf. shell/pwsh-workspace-tracker.ps1),
-    -- donc on branche selon le hostname : serveur TLS cote vibe, client TLS cote local.
-    local is_vibe_server = wezterm.hostname() == VIBE_HOST
-
-    if is_vibe_server then
-        -- Cote serveur : exposer le mux via TLS. Au premier bootstrap SSH depuis le
-        -- client, wezterm genere et echange les certificats automatiquement.
-        -- Pre-requis cote vibe : pare-feu entrant TCP VIBE_TLS_PORT autorise.
-        config.tls_servers = {
-            {
-                bind_address = '0.0.0.0:' .. VIBE_TLS_PORT,
-            },
-        }
-    else
-        -- Cote client : domaine TLS (et non plus SSH). Le PREMIER connect bootstrap
-        -- les certs via SSH (lent, une seule fois) ; ensuite chaque connexion est une
-        -- socket TLS directe vers le mux deja vivant -> on supprime le 'Checking
-        -- server version' et le spawn d'un shell distant a chaque lancement.
-        config.tls_clients = {
-            {
-                name = VIBE_DOMAIN,
-                bootstrap_via_ssh = 'vibe',   -- resolu via ~/.ssh/config (HostName WS871674, User EBerger)
-                remote_address = VIBE_HOST .. ':' .. VIBE_TLS_PORT,
-                -- chemin court 8.3 (sans espace): le bootstrap SSH lance le wezterm
-                -- distant via cmd.exe, qui couperait "C:\Program Files\..." a l'espace.
-                remote_wezterm_path = 'C:\\PROGRA~1\\WezTerm\\wezterm.exe',
-                -- Si le bootstrap se plaint d'un mismatch de hostname sur le cert,
-                -- decommenter la ligne suivante :
-                -- accept_invalid_hostnames = true,
-            },
-        }
-        config.default_domain = VIBE_DOMAIN
-        -- Au lancement, RATTACHER le mux-server vibe existant (et ses fenetres/workspaces
-        -- deja vivants) au lieu de spawn une fenetre 'default' vide. Sans ca, le reopen
-        -- repart sur un workspace neuf et donne l'impression que les sessions sont perdues.
-        config.default_gui_startup_args = { 'connect', VIBE_DOMAIN }
-    end
+    -- 'vibe' = machine distante (10.91.16.171 / WS871674) avec un wezterm-mux-server
+    -- persistant (lance par tache planifiee, cf. VIBE_TLS_SETUP.md). Ce repo est la
+    -- config du CLIENT uniquement ; le serveur a sa propre config ~/.wezterm.lua.
+    --
+    -- TLS direct avec certificats explicites. PAS de bootstrap_via_ssh : sur Windows il
+    -- ne garde pas le mux-server vivant (process tue a la fermeture de la session SSH).
+    -- PKI partagee, generee a la main, hors repo dans ~/.wezterm-tls (ca/client/server).
+    local pki = wezterm.home_dir .. '\\.wezterm-tls\\'
+    config.tls_clients = {
+        {
+            name = VIBE_DOMAIN,
+            -- Cible TLS par IP : le nom court WS871674 ne se resout pas toujours hors interne.
+            remote_address = VIBE_ADDR .. ':' .. VIBE_TLS_PORT,
+            pem_cert = pki .. 'client.crt',
+            pem_private_key = pki .. 'client.key',
+            -- pas de pem_ca (cf. ~/.wezterm.lua serveur) : pem_root_certs suffit comme
+            -- trust store pour valider le certificat serveur.
+            pem_root_certs = { pki .. 'ca.pem' },
+            -- Connexion par IP : le CN ne matche pas le nom, on desactive la verif du
+            -- hostname (le chiffrement et l'auth mutuelle par certificat restent actifs).
+            accept_invalid_hostnames = true,
+        },
+    }
+    config.default_domain = VIBE_DOMAIN
+    -- Au lancement, RATTACHER le mux-server vibe existant au lieu d'une fenetre vide.
+    config.default_gui_startup_args = { 'connect', VIBE_DOMAIN }
 
     config.window_decorations = "RESIZE"
     config.window_background_opacity = 0.95

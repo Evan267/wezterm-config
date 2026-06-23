@@ -2,3 +2,7 @@
 # (poste + vibe). Ne pas versionner, sinon l'etat d'une machine ecrase l'autre.
 workspaces.json
 workspaces-debug.log
+
+# Variables d'environnement par-machine (cf. .env.example, charge par lua/env.lua).
+# Ne pas versionner : chaque machine a ses propres valeurs.
+.env

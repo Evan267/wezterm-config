@@ -21,12 +21,15 @@ vers le mux déjà vivant.
   - sur vibe → `tls_servers` (écoute le port TLS),
   - sur le poste → `tls_clients` (se connecte, bootstrap via SSH au 1ᵉʳ coup).
 
-Constantes dans `lua/options.lua` :
+Variables définies dans `.env` (modèle versionné : `.env.example`) et chargées
+par `lua/env.lua`, puis consommées dans `lua/options.lua`. Le `.env` est dans
+`.gitignore` : chaque machine a le sien (copier `.env.example`). Si une clé
+manque, `lua/env.lua` retombe sur un défaut interne.
 
-| Constante | Valeur | Rôle |
+| Variable | Valeur | Rôle |
 |---|---|---|
 | `VIBE_DOMAIN` | `vibe` | nom du domaine côté client |
-| `VIBE_HOST` | `WS871674` | hostname de la machine vibe |
+| `VIBE_ADDR` | `10.91.16.171` | IP de la machine vibe (`WS871674`) |
 | `VIBE_TLS_PORT` | `8131` | port d'écoute TLS du mux-server |
 
 Le host SSH `vibe` est résolu via `~/.ssh/config` (`HostName WS871674`,
@@ -46,6 +49,11 @@ couperait `C:\Program Files\...` à l'espace).
     User EBerger
   ```
 - Le repo cloné des deux côtés dans `%USERPROFILE%\.config\wezterm`.
+- Sur chaque machine, créer le `.env` à partir du modèle (sinon `lua/env.lua`
+  utilise ses défauts internes) :
+  ```powershell
+  Copy-Item $HOME\.config\wezterm\.env.example $HOME\.config\wezterm\.env
+  ```
 
 ### 1. Côté vibe (serveur)
 

@@ -7,9 +7,12 @@ Ce depot contient une configuration WezTerm modulaire en Lua. Le point d'entree 
 Structure actuelle :
 
 - `wezterm.lua` : point d'entree de la configuration.
+- `lua/env.lua` : chargement des variables depuis `.env` (avec defauts internes).
 - `lua/options.lua` : options visuelles et comportementales de base.
 - `lua/status.lua` : barre native WezTerm et titres d'onglets.
 - `lua/keys.lua` : raccourcis clavier personnalises et navigation de panneaux.
+- `.env` / `.env.example` : variables par-machine (domaine mux). `.env` est
+  gitignore ; `.env.example` est le modele versionne. Voir `VIBE_TLS_SETUP.md`.
 - `WEZTERM_SHORTCUTS.md` : aide-memoire utilisateur des raccourcis.
 
 ## Etat actuel
@@ -32,6 +35,7 @@ La persistance automatique de session n'est pas active dans cette configuration 
 - Eviter les effets de bord globaux sauf necessite WezTerm explicite, par exemple `wezterm.on(...)`.
 - Preferer des noms explicites pour les helpers locaux, comme `split_nav` ou `is_vim`.
 - Conserver les domaines de split en `CurrentPaneDomain` lorsque l'objectif est de garder le contexte du panneau actif.
+- Externaliser les valeurs par-machine (hote, port, domaine mux) dans `.env`, lues via `lua/env.lua` ; ne pas les coder en dur dans les modules. Mettre a jour `.env.example` a chaque ajout de cle.
 
 ## Gestion des plugins
 
