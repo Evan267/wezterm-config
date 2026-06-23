@@ -64,10 +64,6 @@ local function notify(window, message, duration)
   notification_serial = notification_serial + 1
   local serial = notification_serial
 
-  pcall(function()
-    window:toast_notification('WezTerm', message, nil, duration)
-  end)
-
   window:set_right_status(wezterm.format {
     { Attribute = { Intensity = 'Bold' } },
     { Foreground = { AnsiColor = 'Aqua' } },
