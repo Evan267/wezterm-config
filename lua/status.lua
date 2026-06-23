@@ -38,14 +38,15 @@ local function basename(path)
   return normalized:match('([^/]+)/?$') or normalized
 end
 
+-- `pane` est un PaneInformation (passe par format-tab-title) : champs, pas methodes.
 local function pane_title(pane)
-  local title = pane:get_title()
+  local title = pane.title
 
   if title and title ~= '' then
     return title
   end
 
-  return basename(pane:get_foreground_process_name()) or 'shell'
+  return basename(pane.foreground_process_name) or 'shell'
 end
 
 local function tab_title(tab)
