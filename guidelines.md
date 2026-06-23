@@ -19,7 +19,6 @@ Structure actuelle :
 
 La configuration active charge actuellement :
 
-- `wezterm-quota-limit` pour la gestion de quota.
 - `lua/options.lua` pour les options generales.
 - `lua/status.lua` pour la barre native WezTerm.
 - `lua/keys.lua` pour les raccourcis clavier.
