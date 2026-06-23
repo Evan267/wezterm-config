@@ -37,17 +37,17 @@ Le **Leader Key** est le préfixe nécessaire pour les commandes système.
 
 Les commandes de workspace utilisent uniquement `ALT` comme modificateur. Les variantes `Leader` ont ete retirees.
 
-| Raccourci | Action | Description |
-| :--- | :--- | :--- |
-| `ALT` + `n` | **Nouveau Workspace** | Demande un nom puis bascule vers ce workspace non enregistre |
-| `ALT` + `t` | **Renommer Tab** | Demande un nom pour le tab actif puis enregistre le workspace courant |
-| `ALT` + `r` | **Enregistrer Workspace** | Enregistre ou met a jour le workspace actif |
-| `ALT` + `o` | **Ouvrir Workspace ici** | Affiche les workspaces enregistres et ouvre la selection dans la fenetre courante |
+| Raccourci             | Action                          | Description                                                                                                          |
+| :-------------------- | :------------------------------ | :------------------------------------------------------------------------------------------------------------------- |
+| `ALT` + `n`           | **Nouveau Workspace**           | Demande un nom puis bascule vers ce workspace non enregistre                                                         |
+| `ALT` + `t`           | **Renommer Tab**                | Demande un nom pour le tab actif puis enregistre le workspace courant                                                |
+| `ALT` + `r`           | **Enregistrer Workspace**       | Enregistre ou met a jour le workspace actif                                                                          |
+| `ALT` + `o`           | **Ouvrir Workspace ici**        | Affiche les workspaces enregistres et ouvre la selection dans la fenetre courante                                    |
 | `ALT` + `SHIFT` + `o` | **Ouvrir Workspace en fenetre** | Focalise la fenetre existante si le workspace est deja ouvert; sinon restaure la selection dans une nouvelle fenetre |
-| `ALT` + `d` | **Supprimer Workspace** | Affiche les workspaces enregistres et supprime la selection du registre |
-| `ALT` + `SHIFT` + `q` | **Quitter WezTerm** | Ferme toute l'application WezTerm, avec toutes les fenetres, tabs et panes |
-| `ALT` + `←` | **Workspace precedent** | Bascule vers le workspace enregistre precedent |
-| `ALT` + `→` | **Workspace suivant** | Bascule vers le workspace enregistre suivant |
+| `ALT` + `d`           | **Supprimer Workspace**         | Affiche les workspaces enregistres et supprime la selection du registre                                              |
+| `ALT` + `SHIFT` + `q` | **Quitter WezTerm**             | Ferme toute l'application WezTerm, avec toutes les fenetres, tabs et panes                                           |
+| `ALT` + `←`           | **Workspace precedent**         | Bascule vers le workspace enregistre precedent                                                                       |
+| `ALT` + `→`           | **Workspace suivant**           | Bascule vers le workspace enregistre suivant                                                                         |
 
 ---
 
