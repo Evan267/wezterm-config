@@ -6,7 +6,12 @@ local debug_path = wezterm.config_dir .. '/workspaces-debug.log'
 local snapshot_version = 1
 local notification_duration = 2500
 local error_notification_duration = 5000
-local notification_serial = 0
+-- Notification courante affichee dans le statut droit, avec son horodatage
+-- d'expiration. L'effacement est pilote par l'evenement update-status (qui
+-- recoit une window valide a chaque tick) et non par un timer a window
+-- capturee : ce dernier pouvait echouer silencieusement et laisser le message
+-- affiche indefiniment.
+local active_notification = nil
 
 local shell_names = {
   bash = true,
@@ -59,31 +64,46 @@ local function append_debug(message)
   file:close()
 end
 
+local function render_notification(window)
+  pcall(function()
+    window:set_right_status(active_notification and active_notification.text or '')
+  end)
+end
+
 local function notify(window, message, duration)
   duration = duration or notification_duration
-  notification_serial = notification_serial + 1
-  local serial = notification_serial
 
-  window:set_right_status(wezterm.format {
-    { Attribute = { Intensity = 'Bold' } },
-    { Foreground = { AnsiColor = 'Aqua' } },
-    { Text = ' ' .. message .. ' ' },
-  })
+  active_notification = {
+    text = wezterm.format {
+      { Attribute = { Intensity = 'Bold' } },
+      { Foreground = { AnsiColor = 'Aqua' } },
+      { Text = ' ' .. message .. ' ' },
+    },
+    -- os.time() est en secondes et update-status tourne toutes les 1000 ms : une
+    -- resolution a la seconde suffit. Arrondi au superieur, minimum 1 s.
+    expiry = os.time() + math.max(1, math.ceil(duration / 1000)),
+  }
 
-  if wezterm.time and wezterm.time.call_after then
-    wezterm.time.call_after(duration / 1000, function()
-      if serial == notification_serial then
-        pcall(function()
-          window:set_right_status('')
-        end)
-      end
-    end)
-  end
+  render_notification(window)
 end
 
 local function notify_error(window, message)
   notify(window, message, error_notification_duration)
 end
+
+-- Efface la notification une fois son delai ecoule. Pilote par update-status
+-- pour disposer d'une window valide a chaque tick (~1 s).
+wezterm.on('update-status', function(window)
+  if not active_notification then
+    return
+  end
+
+  if os.time() >= active_notification.expiry then
+    active_notification = nil
+  end
+
+  render_notification(window)
+end)
 
 local function normalize_registry(value)
   if type(value) ~= 'table' then
