@@ -376,11 +376,24 @@ local function find_workspace(registry, name)
   return nil, nil
 end
 
-local function registered_workspaces(registry)
+-- L'archivage est un masquage doux et reversible : un marqueur `archived_at`
+-- (horodatage ISO, meme format que `saved_at`) retire le workspace des listes
+-- du quotidien sans rien supprimer. Absence du champ = workspace actif.
+local function is_archived(workspace)
+  return type(workspace) == 'table' and workspace.archived_at ~= nil
+end
+
+-- filter: 'active' (defaut) | 'archived' | 'all'
+local function list_workspaces(registry, filter)
+  filter = filter or 'active'
   local result = {}
 
   for _, workspace in ipairs(registry.workspaces) do
-    if workspace.name == canonical_workspace_name(workspace.name) then
+    local archived = is_archived(workspace)
+
+    if filter == 'all'
+      or (filter == 'archived' and archived)
+      or (filter == 'active' and not archived) then
       table.insert(result, workspace)
     end
   end
@@ -400,6 +413,23 @@ local function remove_workspace(name)
   return save_registry(registry)
 end
 
+local function set_workspace_archived(name, archived)
+  local registry = load_registry()
+  local workspace = find_workspace(registry, name)
+
+  if not workspace then
+    return false
+  end
+
+  if archived then
+    workspace.archived_at = os.date('!%Y-%m-%dT%H:%M:%SZ')
+  else
+    workspace.archived_at = nil
+  end
+
+  return save_registry(registry)
+end
+
 local function upsert_workspace(name, snapshot)
   append_debug('upsert start name=' .. tostring(name))
   local registry = load_registry()
@@ -407,6 +437,12 @@ local function upsert_workspace(name, snapshot)
   snapshot.name = name
 
   if existing then
+    -- L'etat d'archivage vit dans le registre, pas dans le snapshot capture :
+    -- le preserver, sinon un simple ALT+r (enregistrer) l'effacerait.
+    if existing.archived_at ~= nil and snapshot.archived_at == nil then
+      snapshot.archived_at = existing.archived_at
+    end
+
     for key in pairs(existing) do
       existing[key] = nil
     end
@@ -1161,7 +1197,7 @@ function M.choose_registered(window, pane, mode)
     title = 'Ouvrir un workspace en nouvelle fenetre'
   end
 
-  for _, workspace in ipairs(registered_workspaces(registry)) do
+  for _, workspace in ipairs(list_workspaces(registry, 'active')) do
     table.insert(choices, {
       id = workspace.name,
       label = workspace.name,
@@ -1202,10 +1238,11 @@ function M.choose_delete_registered(window, pane)
   local registry = load_registry()
   local choices = {}
 
-  for _, workspace in ipairs(registered_workspaces(registry)) do
+  for _, workspace in ipairs(list_workspaces(registry, 'all')) do
+    local suffix = is_archived(workspace) and '  (archive)' or ''
     table.insert(choices, {
       id = workspace.name,
-      label = workspace.name,
+      label = workspace.name .. suffix,
     })
   end
 
@@ -1243,9 +1280,99 @@ function M.choose_delete_registered(window, pane)
   )
 end
 
+function M.choose_archive(window, pane)
+  local registry = load_registry()
+  local choices = {}
+
+  for _, workspace in ipairs(list_workspaces(registry, 'active')) do
+    table.insert(choices, {
+      id = workspace.name,
+      label = workspace.name,
+    })
+  end
+
+  if #choices == 0 then
+    notify(window, 'Aucun workspace actif a archiver.')
+    return
+  end
+
+  window:perform_action(
+    wezterm.action.InputSelector {
+      title = 'Archiver un workspace',
+      choices = choices,
+      fuzzy = true,
+      action = wezterm.action_callback(function(win, _, id, label)
+        local name = id or label
+
+        if not name then
+          return
+        end
+
+        local ok, done = pcall(function()
+          return set_workspace_archived(name, true)
+        end)
+
+        if ok and done then
+          append_debug('archive workspace name=' .. tostring(name))
+          notify(win, 'Workspace archive: ' .. name)
+        else
+          append_debug('archive failed name=' .. tostring(name) .. ' err=' .. tostring(done))
+          notify_error(win, 'Impossible d archiver: ' .. name)
+        end
+      end),
+    },
+    pane
+  )
+end
+
+function M.choose_unarchive(window, pane)
+  local registry = load_registry()
+  local choices = {}
+
+  for _, workspace in ipairs(list_workspaces(registry, 'archived')) do
+    table.insert(choices, {
+      id = workspace.name,
+      label = workspace.name,
+    })
+  end
+
+  if #choices == 0 then
+    notify(window, 'Aucun workspace archive.')
+    return
+  end
+
+  window:perform_action(
+    wezterm.action.InputSelector {
+      title = 'Desarchiver un workspace',
+      choices = choices,
+      fuzzy = true,
+      action = wezterm.action_callback(function(win, _, id, label)
+        local name = id or label
+
+        if not name then
+          return
+        end
+
+        local ok, done = pcall(function()
+          return set_workspace_archived(name, false)
+        end)
+
+        if ok and done then
+          append_debug('unarchive workspace name=' .. tostring(name))
+          notify(win, 'Workspace desarchive: ' .. name)
+        else
+          append_debug('unarchive failed name=' .. tostring(name) .. ' err=' .. tostring(done))
+          notify_error(win, 'Impossible de desarchiver: ' .. name)
+        end
+      end),
+    },
+    pane
+  )
+end
+
 function M.activate_relative(window, pane, offset)
   local registry = load_registry()
-  local workspaces = registered_workspaces(registry)
+  local workspaces = list_workspaces(registry, 'active')
 
   if #workspaces == 0 then
     notify(window, 'Aucun workspace enregistre.')

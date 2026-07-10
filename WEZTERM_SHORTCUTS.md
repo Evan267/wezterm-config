@@ -44,7 +44,9 @@ Les commandes de workspace utilisent uniquement `ALT` comme modificateur. Les va
 | `ALT` + `r`           | **Enregistrer Workspace**       | Enregistre ou met a jour le workspace actif                                                                          |
 | `ALT` + `o`           | **Ouvrir Workspace ici**        | Affiche les workspaces enregistres et ouvre la selection dans la fenetre courante                                    |
 | `ALT` + `SHIFT` + `o` | **Ouvrir Workspace en fenetre** | Focalise la fenetre existante si le workspace est deja ouvert; sinon restaure la selection dans une nouvelle fenetre |
-| `ALT` + `d`           | **Supprimer Workspace**         | Affiche les workspaces enregistres et supprime la selection du registre                                              |
+| `ALT` + `d`           | **Supprimer Workspace**         | Affiche les workspaces enregistres (actifs et archives) et supprime la selection du registre                        |
+| `ALT` + `a`           | **Archiver Workspace**          | Liste les workspaces actifs et archive la selection : masquee de `ALT+o` et du cycle, mais conservee dans le registre |
+| `ALT` + `u`           | **Desarchiver Workspace**       | Liste les workspaces archives et reactive la selection (redevient visible dans `ALT+o` et le cycle)                 |
 | `ALT` + `SHIFT` + `q` | **Quitter WezTerm**             | Ferme toute l'application WezTerm, avec toutes les fenetres, tabs et panes                                           |
 | `ALT` + `←`           | **Workspace precedent**         | Bascule vers le workspace enregistre precedent                                                                       |
 | `ALT` + `→`           | **Workspace suivant**           | Bascule vers le workspace enregistre suivant                                                                         |
@@ -59,4 +61,5 @@ Les commandes de workspace utilisent uniquement `ALT` comme modificateur. Les va
 * **Titres de tabs** : Les titres definis avec `ALT` + `t` sont stockes dans `workspaces.json` et reappliques lors de la restauration.
 * **Restauration workspace** : Si le workspace est deja ouvert, la config le rejoint sans relancer les commandes. Sinon, elle recree les tabs/panes, retourne dans les repertoires sauvegardes et relance la derniere commande quand elle est disponible.
 * **Suppression workspace** : La suppression retire uniquement l'entree du registre; elle ne ferme pas un workspace deja ouvert.
+* **Archivage workspace** : L'archivage (`ALT` + `a`) retire le workspace des listes du quotidien (`ALT` + `o` et cycle `ALT` + `←`/`→`) sans rien supprimer : tabs, panes et cwd restent intacts dans `workspaces.json` (marqueur `archived_at`). `ALT` + `u` le reactive. L'operation est reversible autant de fois que voulu et n'affecte pas une session deja ouverte. Un workspace archive reste supprimable via `ALT` + `d` (marque « (archive) » dans la liste).
 * **Suivi shell** : Le fichier `shell/bash-workspace-tracker.bash` publie le repertoire courant et la derniere commande a WezTerm via des user vars.

@@ -60,6 +60,24 @@ La navigation de panneaux utilise les touches Vim :
 
 Le helper `split_nav` transmet les touches a Neovim si la variable utilisateur `IS_NVIM` vaut `true`. Cela permet de conserver une navigation coherente entre WezTerm et Neovim.
 
+## Workspaces (persistance et archivage)
+
+Le module `lua/workspaces.lua` capture/restaure les workspaces dans
+`workspaces.json` (gitignore, etat runtime par-machine). Points de maintenance :
+
+- **Etat d'un workspace** : actif ou archive, porte par le champ optionnel
+  `archived_at` (horodatage ISO, meme format que `saved_at`). Absence du champ =
+  actif. L'archivage est un masquage doux et reversible, distinct de la
+  suppression : aucune donnee n'est detruite.
+- **Filtrage** : `list_workspaces(registry, filter)` avec `filter` valant
+  `'active'` (defaut), `'archived'` ou `'all'`. Les listes du quotidien
+  (ouverture `ALT+o`, cycle `ALT+←/→`) n'affichent que les actifs ; la suppression
+  (`ALT+d`) liste tout.
+- **Invariant a preserver** : `upsert_workspace` recopie le snapshot capture (qui
+  ignore `archived_at`) ; il doit reporter `archived_at` depuis l'entree
+  existante, sinon un simple `ALT+r` effacerait l'archivage. Ne pas regresser ce
+  point.
+
 ## Documentation
 
 - Mettre a jour `WEZTERM_SHORTCUTS.md` a chaque ajout, suppression ou modification de raccourci.

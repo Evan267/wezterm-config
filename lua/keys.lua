@@ -113,6 +113,20 @@ function M.apply(config)
       end),
     },
     {
+      key = 'a',
+      mods = 'ALT',
+      action = w.action_callback(function(window, pane)
+	workspaces.choose_archive(window, pane)
+      end),
+    },
+    {
+      key = 'u',
+      mods = 'ALT',
+      action = w.action_callback(function(window, pane)
+	workspaces.choose_unarchive(window, pane)
+      end),
+    },
+    {
       key = 'Q',
       mods = 'ALT',
       action = w.action.QuitApplication,
