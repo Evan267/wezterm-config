@@ -99,6 +99,13 @@ function M.apply(config)
       end),
     },
     {
+      key = 'R',
+      mods = 'ALT',
+      action = w.action_callback(function(window, pane)
+	workspaces.restore_all_active(window, pane)
+      end),
+    },
+    {
       key = 'O',
       mods = 'ALT',
       action = w.action_callback(function(window, pane)

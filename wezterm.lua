@@ -6,5 +6,6 @@ options.apply(config)
 options.apply_dynamic_color_scheme()
 require('lua/status').apply(config)
 require('lua/keys').apply(config)
+require('lua/workspaces').start_auto_save()
 
 return config

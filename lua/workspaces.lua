@@ -28,6 +28,24 @@ local shell_names = {
   zsh = true,
 }
 
+-- Commandes qu'on ne rejoue JAMAIS au restore : soit triviales (elles ecrasent
+-- l'intention utile sans rien apporter), soit dangereuses. `wezterm-mux-server`
+-- en est le cas critique : un pane du snapshot le portait en `last_command`
+-- (cf. workspaces.json), le rejouer relancerait un mux-server dans un pane.
+-- Comparaison sur le premier token, basename sans extension, en minuscules.
+local non_replayable_commands = {
+  cd = true,
+  clear = true,
+  cls = true,
+  exit = true,
+  la = true,
+  ll = true,
+  logout = true,
+  ls = true,
+  pwd = true,
+  ['wezterm-mux-server'] = true,
+}
+
 local function read_file(path)
   local file = io.open(path, 'r')
 
@@ -154,6 +172,29 @@ local function is_shell(argv)
   return shell_names[basename(argv[1])] == true
 end
 
+-- Normalise un token de commande vers sa forme de comparaison : basename, sans
+-- extension .exe, en minuscules (ex: 'C:\...\Wezterm-Mux-Server.exe' -> 'wezterm-mux-server').
+local function normalized_command_word(word)
+  if type(word) ~= 'string' or word == '' then
+    return nil
+  end
+
+  return (basename(word):gsub('%.exe$', ''):lower())
+end
+
+-- true si `command` peut etre rejouee au restore : non vide, sur une seule
+-- ligne, et dont le premier mot n'est pas dans la denylist.
+local function is_replayable_command(command)
+  if type(command) ~= 'string' or command == '' or command:find('[\r\n]') then
+    return false
+  end
+
+  local first = command:match('^%s*(%S+)')
+  local word = normalized_command_word(first)
+
+  return word ~= nil and not non_replayable_commands[word]
+end
+
 local function copy_array(value)
   if type(value) ~= 'table' then
     return nil
@@ -217,7 +258,16 @@ local function normalize_remote_path(path)
 end
 
 local function current_working_dir(pane)
-  local cwd = pane:get_current_working_dir()
+  -- Protege : si le pane disparait entre l'enumeration et cette lecture (pane
+  -- ephemere, process qui se ferme), l'exception ne doit pas remonter et faire
+  -- tomber la capture entiere du workspace.
+  local ok, cwd = pcall(function()
+    return pane:get_current_working_dir()
+  end)
+
+  if not ok then
+    return nil
+  end
 
   if type(cwd) == 'userdata' and (not cwd.scheme or cwd.scheme == 'file') and cwd.file_path then
     return normalize_remote_path(cwd.file_path)
@@ -469,11 +519,12 @@ local function pane_spawn(pane_snapshot)
   local command = type(pane_snapshot.last_command) == 'string' and pane_snapshot.last_command or nil
   local spawn = {}
 
-  if argv and (argv[1]:match('^%-%-') or pane_snapshot.title == 'wslhost.exe') then
+  if argv and (argv[1]:match('^%-%-') or pane_snapshot.title == 'wslhost.exe'
+    or non_replayable_commands[normalized_command_word(argv[1]) or '']) then
     argv = nil
   end
 
-  if command == '' or (command and command:find('[\r\n]')) then
+  if not is_replayable_command(command) then
     command = nil
   end
 
@@ -661,9 +712,40 @@ local function mux_window_tabs(mux_window)
   return {}
 end
 
-local function capture_current_window(window, active_pane)
+-- Capture d'un seul pane. Isolee dans son propre pcall par l'appelant : un pane
+-- mort (course : fermeture, process qui sort avec exit_behavior='Close') doit
+-- etre ignore, pas faire tomber la capture des autres panes du workspace.
+local function capture_pane(item)
+  local p = item.pane
+  local rect = pane_rect(item)
+  local argv = pane_process_argv(p)
+  local command = argv and table.concat(argv, ' ') or nil
+  local title = pane_title(p)
+  local tracked_cwd = pane_user_var(p, 'WEZTERM_WORKSPACE_CWD')
+  local last_command = pane_user_var(p, 'WEZTERM_WORKSPACE_LAST_COMMAND')
+  local cwd = tracked_cwd or cwd_from_title(title) or current_working_dir(p)
+
+  if argv and (argv[1]:match('^%-%-') or title == 'wslhost.exe') then
+    argv = nil
+    command = nil
+  end
+
+  return {
+    cwd = cwd,
+    argv = argv,
+    command = command,
+    last_command = last_command,
+    title = title,
+    x = rect.x,
+    y = rect.y,
+    cols = rect.cols,
+    rows = rect.rows,
+    is_active = item.is_active == true,
+  }
+end
+
+local function capture_mux_window(mux_window, active_pane)
   append_debug('capture start')
-  local mux_window = window:mux_window()
   local tabs = {}
 
   for _, tab in ipairs(mux_window_tabs(mux_window)) do
@@ -678,32 +760,13 @@ local function capture_current_window(window, active_pane)
     end
 
     for _, item in ipairs(panes_with_info) do
-      local p = item.pane
-      local rect = pane_rect(item)
-      local argv = pane_process_argv(p)
-      local command = argv and table.concat(argv, ' ') or nil
-      local title = pane_title(p)
-      local tracked_cwd = pane_user_var(p, 'WEZTERM_WORKSPACE_CWD')
-      local last_command = pane_user_var(p, 'WEZTERM_WORKSPACE_LAST_COMMAND')
-      local cwd = tracked_cwd or cwd_from_title(title) or current_working_dir(p)
+      local ok_pane, pane = pcall(capture_pane, item)
 
-      if argv and (argv[1]:match('^%-%-') or title == 'wslhost.exe') then
-        argv = nil
-        command = nil
+      if ok_pane and type(pane) == 'table' then
+        table.insert(panes, pane)
+      else
+        append_debug('pane capture skipped: ' .. tostring(pane))
       end
-
-      table.insert(panes, {
-        cwd = cwd,
-        argv = argv,
-        command = command,
-        last_command = last_command,
-        title = title,
-        x = rect.x,
-        y = rect.y,
-        cols = rect.cols,
-        rows = rect.rows,
-        is_active = item.is_active == true,
-      })
     end
 
     table.insert(tabs, {
@@ -724,6 +787,76 @@ local function capture_current_window(window, active_pane)
 
   append_debug('capture done tabs=' .. tostring(#tabs))
   return snapshot
+end
+
+local function capture_current_window(window, active_pane)
+  return capture_mux_window(window:mux_window(), active_pane)
+end
+
+-- Intervalle de l'auto-sauvegarde (secondes). Rafraichit les snapshots des
+-- workspaces DEJA enregistres pour que le « tout restaurer » (ALT+Shift+R) apres
+-- un redemarrage du mux-server reparte d'un etat recent, pas d'un vieux ALT+r.
+local auto_save_interval = 60
+
+-- Un snapshot « avec contenu » a au moins un pane portant un cwd reel ou un
+-- argv. Garde-fou de l'auto-save : apres un redemarrage du mux-server, les panes
+-- morts sont filtres (pcall par pane) et le snapshot devient vide ; on refuse
+-- alors d'ecraser une bonne sauvegarde par du vide.
+local function snapshot_has_content(snapshot)
+  if type(snapshot) ~= 'table' or type(snapshot.tabs) ~= 'table' then
+    return false
+  end
+
+  for _, tab in ipairs(snapshot.tabs) do
+    if type(tab.panes) == 'table' then
+      for _, pane in ipairs(tab.panes) do
+        if (type(pane.cwd) == 'string' and pane.cwd ~= '')
+          or (type(pane.argv) == 'table' and #pane.argv > 0) then
+          return true
+        end
+      end
+    end
+  end
+
+  return false
+end
+
+-- Rafraichit les snapshots des workspaces DEJA presents dans le registre a
+-- partir de leurs fenetres mux vivantes. Ne CREE jamais d'entree (les nouveaux
+-- workspaces restent crees a la main via ALT+r) et n'ecrase jamais avec du vide
+-- (snapshot_has_content). upsert_workspace preserve `archived_at`.
+local function refresh_saved_workspaces()
+  if not wezterm.mux or not wezterm.mux.all_windows then
+    return
+  end
+
+  local known = {}
+
+  for _, workspace in ipairs(load_registry().workspaces) do
+    known[workspace.name] = true
+  end
+
+  for _, mux_window in ipairs(wezterm.mux.all_windows()) do
+    local ok, name = pcall(function()
+      return canonical_workspace_name(mux_window:get_workspace())
+    end)
+
+    if ok and known[name] then
+      local captured, snapshot = pcall(capture_mux_window, mux_window, nil)
+
+      if captured and snapshot_has_content(snapshot) then
+        pcall(upsert_workspace, name, snapshot)
+      end
+    end
+  end
+end
+
+local function auto_save_tick()
+  pcall(refresh_saved_workspaces)
+
+  if wezterm.time and wezterm.time.call_after then
+    wezterm.time.call_after(auto_save_interval, auto_save_tick)
+  end
 end
 
 local function bounds(panes)
@@ -1387,6 +1520,46 @@ function M.activate_relative(window, pane, offset)
 
   local next_index = ((index - 1 + offset) % #workspaces) + 1
   restore_workspace(window, pane, workspaces[next_index])
+end
+
+-- Restaure TOUS les workspaces actifs (non archives), chacun dans sa fenetre.
+-- Usage typique : apres un redemarrage du mux-server de vibe, quand les panes
+-- vivants sont morts avec lui. Les workspaces deja vivants sont ignores (pas de
+-- doublon), ceux sans snapshot de tabs aussi.
+function M.restore_all_active(window, pane)
+  local workspaces = list_workspaces(load_registry(), 'active')
+
+  if #workspaces == 0 then
+    notify(window, 'Aucun workspace actif a restaurer.')
+    return
+  end
+
+  local restored = 0
+
+  for _, workspace in ipairs(workspaces) do
+    if type(workspace.tabs) == 'table' and #workspace.tabs > 0
+      and not workspace_exists(workspace.name) then
+      restore_workspace(window, pane, workspace, 'new')
+      restored = restored + 1
+    end
+  end
+
+  notify(window, 'Workspaces restaures: ' .. restored .. '/' .. #workspaces)
+end
+
+-- Demarre la boucle d'auto-sauvegarde (une seule fois par process, meme apres un
+-- reload de config, grace au drapeau GLOBAL).
+function M.start_auto_save()
+  if wezterm.GLOBAL.workspace_auto_save_started then
+    return
+  end
+
+  if not (wezterm.time and wezterm.time.call_after) then
+    return
+  end
+
+  wezterm.GLOBAL.workspace_auto_save_started = true
+  wezterm.time.call_after(auto_save_interval, auto_save_tick)
 end
 
 return M

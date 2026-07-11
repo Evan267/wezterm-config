@@ -77,6 +77,27 @@ Le module `lua/workspaces.lua` capture/restaure les workspaces dans
   ignore `archived_at`) ; il doit reporter `archived_at` depuis l'entree
   existante, sinon un simple `ALT+r` effacerait l'archivage. Ne pas regresser ce
   point.
+- **Perte au redemarrage du mux-server** : les panes sont des process enfants du
+  `wezterm-mux-server` de vibe ; s'il redemarre, ils meurent (aucune persistance
+  disque cote mux-server). La reprise est **manuelle et fiabilisee**, pas
+  automatique : `ALT+Shift+R` (`M.restore_all_active`) relance tous les
+  workspaces actifs, chacun en nouvelle fenetre, en ignorant ceux deja vivants.
+- **Auto-sauvegarde** (`M.start_auto_save`, demarree depuis `wezterm.lua`) :
+  boucle `wezterm.time.call_after` toutes les `auto_save_interval` s (60). Elle ne
+  rafraichit que les workspaces **deja presents** dans le registre (jamais de
+  creation implicite ; la creation reste `ALT+r`). Demarree une seule fois par
+  process via le drapeau `wezterm.GLOBAL.workspace_auto_save_started` (un reload
+  de config ne doit pas empiler une 2e boucle).
+- **Invariant anti-ecrasement** : l'auto-save ne doit **jamais** ecraser une
+  sauvegarde par un etat vide. Apres un redemarrage du mux-server, les panes
+  morts sont filtres (pcall par pane dans `capture_pane`) et le snapshot devient
+  vide : `snapshot_has_content` doit alors bloquer l'`upsert`. Ne pas regresser.
+- **Denylist de rejeu** (`non_replayable_commands` / `is_replayable_command`) :
+  certaines `last_command` ne sont jamais rejouees au restore, soit triviales
+  (`cd`, `clear`, `ls`, `exit`, …), soit dangereuses (`wezterm-mux-server` :
+  presente en `last_command` dans le registre, la rejouer relancerait un
+  mux-server dans un pane). Comparaison sur le 1er token, basename sans `.exe`,
+  minuscule.
 
 ## Documentation
 
