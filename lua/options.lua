@@ -91,6 +91,12 @@ function M.apply(config)
     config.default_gui_startup_args = { 'connect', VIBE_DOMAIN }
 
     config.window_decorations = "RESIZE"
+    -- Front-end OpenGL force : le defaut WebGpu sur Windows laisse par moments des
+    -- regions non-repeintes apres un split/resize/restauration de workspace (panes
+    -- qui semblent s'arreter avant le bas, framebuffer/bureau qui transparait). Le
+    -- compositing transparent (opacity < 1.0 ci-dessous) rend le glitch visible.
+    -- OpenGL est nettement plus stable sur Windows avec transparence.
+    config.front_end = "OpenGL"
     config.window_background_opacity = 0.95
 
     config.window_padding = { left = 5, right = 5, top = 5, bottom = 5 }

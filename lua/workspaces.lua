@@ -575,6 +575,19 @@ local function first_leaf_pane(node)
   return {}
 end
 
+-- Spawn epingle sur le domaine par defaut (config.default_domain = vibe).
+--
+-- Indispensable des qu'un SwitchToWorkspace est declenche depuis le callback d'un
+-- selecteur ou d'un prompt : le `pane` fourni a ce callback est le pane d'OVERLAY
+-- (TermWizTerminalPane). Sans `domain`, WezTerm resout `CurrentPaneDomain` vers
+-- `TermWizTerminalDomain` et refuse le spawn ("cannot spawn panes in a
+-- TermWizTerminalPane") : le workspace s'ouvrait alors sans aucun pane.
+--
+-- Table neuve a chaque appel : merge_spawn_options ecrit dans `base`.
+local function default_domain_spawn()
+  return { domain = 'DefaultDomain' }
+end
+
 local function merge_spawn_options(base, spawn)
   if spawn then
     for key, value in pairs(spawn) do
@@ -610,17 +623,13 @@ local function focus_mux_window_soon(mux_window)
   end
 end
 
-local function workspace_exists(name)
-  if wezterm.mux and wezterm.mux.get_workspace_names then
-    for _, workspace in ipairs(wezterm.mux.get_workspace_names()) do
-      if workspace == name then
-        return true
-      end
-    end
-  end
+-- Fenetres mux portant ce workspace (souvent zero : le nom peut exister dans
+-- wezterm.mux.get_workspace_names() sans aucune fenetre).
+local function workspace_mux_windows(name)
+  local windows = {}
 
   if not wezterm.mux or not wezterm.mux.all_windows then
-    return false
+    return windows
   end
 
   for _, mux_window in ipairs(wezterm.mux.all_windows()) do
@@ -629,35 +638,52 @@ local function workspace_exists(name)
     end)
 
     if ok and workspace == name then
-      return true
+      table.insert(windows, mux_window)
     end
   end
 
-  return false
+  return windows
 end
 
-local function focus_workspace_window(name)
-  if not wezterm.mux or not wezterm.mux.all_windows then
-    return false
-  end
+-- Compte les panes reellement presents dans les fenetres du workspace, et
+-- journalise l'etat vu du mux. Necessaire car un workspace « ouvert mais vide »
+-- (fenetre sans tab, ou coquille laissee par un mux-server redemarre) doit
+-- pouvoir etre restaure : se fier au seul nom, ou a la seule presence d'une
+-- fenetre, bloquait sa propre restauration (« Workspaces restaures: 0/3 »).
+local function workspace_pane_count(name)
+  local windows = workspace_mux_windows(name)
+  local tab_count, pane_count = 0, 0
 
-  for _, mux_window in ipairs(wezterm.mux.all_windows()) do
-    local ok, workspace = pcall(function()
-      return mux_window:get_workspace()
+  for _, mux_window in ipairs(windows) do
+    local ok, tabs = pcall(function()
+      return mux_window:tabs()
     end)
 
-    if ok and workspace == name then
-      local focus_ok = pcall(function()
-        mux_window:gui_window():focus()
-      end)
+    if ok and type(tabs) == 'table' then
+      tab_count = tab_count + #tabs
 
-      if focus_ok then
-        return true
+      for _, tab in ipairs(tabs) do
+        local ok_panes, panes = pcall(function()
+          return tab:panes()
+        end)
+
+        if ok_panes and type(panes) == 'table' then
+          pane_count = pane_count + #panes
+        end
       end
     end
   end
 
-  return false
+  append_debug('workspace state name=' .. tostring(name)
+    .. ' windows=' .. #windows .. ' tabs=' .. tab_count .. ' panes=' .. pane_count)
+
+  return pane_count
+end
+
+-- Vivant = au moins un pane. Un workspace connu du mux mais sans aucun pane est
+-- une coquille : on le restaure au lieu de le sauter.
+local function workspace_is_live(name)
+  return workspace_pane_count(name) > 0
 end
 
 local function pane_rect(pane_info)
@@ -1022,8 +1048,13 @@ end
 local function restore_workspace_in_new_window(window, pane, workspace)
   local first_tab = workspace.tabs[1]
   local first_layout = build_tab_layout(first_tab)
+  -- `workspace` est indispensable : sans lui, mux.spawn_window place la fenetre
+  -- dans le workspace ACTIF, pas dans celui qu'on restaure. Le workspace cible
+  -- restait alors une coquille vide pendant que son contenu s'ouvrait ailleurs.
   local ok, first_mux_tab, first_mux_pane, mux_window = pcall(function()
     return wezterm.mux.spawn_window(merge_spawn_options({
+      workspace = workspace.name,
+      domain = 'DefaultDomain',
       position = { origin = 'ActiveScreen', x = 80, y = 80 },
     }, first_layout_spawn(workspace, 1, first_layout)))
   end)
@@ -1133,7 +1164,10 @@ local function restore_workspace_in_current_window(window, pane, workspace)
   window:perform_action(
     wezterm.action.SwitchToWorkspace {
       name = workspace.name,
-      spawn = first_layout_spawn(workspace, 1, build_tab_layout(first_tab)),
+      spawn = merge_spawn_options(
+        default_domain_spawn(),
+        first_layout_spawn(workspace, 1, build_tab_layout(first_tab))
+      ),
     },
     pane
   )
@@ -1170,7 +1204,7 @@ local function restore_workspace(window, pane, workspace, mode)
     return
   end
 
-  if workspace_exists(workspace.name) then
+  if workspace_is_live(workspace.name) then
     append_debug('restore live switch name=' .. tostring(workspace.name))
 
     window:perform_action(wezterm.action.SwitchToWorkspace { name = workspace.name }, pane)
@@ -1180,7 +1214,13 @@ local function restore_workspace(window, pane, workspace, mode)
 
   if type(workspace.tabs) ~= 'table' or #workspace.tabs == 0 then
     append_debug('restore legacy workspace name=' .. tostring(workspace.name))
-    window:perform_action(wezterm.action.SwitchToWorkspace { name = workspace.name }, pane)
+    window:perform_action(
+      wezterm.action.SwitchToWorkspace {
+        name = workspace.name,
+        spawn = default_domain_spawn(),
+      },
+      pane
+    )
     return
   end
 
@@ -1207,6 +1247,7 @@ function M.prompt_new_workspace(window, pane)
         if line and line ~= '' then
           win:perform_action(wezterm.action.SwitchToWorkspace {
             name = line,
+            spawn = default_domain_spawn(),
           }, p)
         end
       end),
@@ -1526,6 +1567,9 @@ end
 -- Usage typique : apres un redemarrage du mux-server de vibe, quand les panes
 -- vivants sont morts avec lui. Les workspaces deja vivants sont ignores (pas de
 -- doublon), ceux sans snapshot de tabs aussi.
+--
+-- Le decompte distingue ces deux raisons de saut : « 0/3 » tout court ne disait
+-- pas si les workspaces etaient deja ouverts ou depourvus de snapshot.
 function M.restore_all_active(window, pane)
   local workspaces = list_workspaces(load_registry(), 'active')
 
@@ -1534,17 +1578,38 @@ function M.restore_all_active(window, pane)
     return
   end
 
-  local restored = 0
+  local restored, live, empty = 0, 0, 0
 
   for _, workspace in ipairs(workspaces) do
-    if type(workspace.tabs) == 'table' and #workspace.tabs > 0
-      and not workspace_exists(workspace.name) then
+    if type(workspace.tabs) ~= 'table' or #workspace.tabs == 0 then
+      append_debug('restore all skip (aucun snapshot) name=' .. tostring(workspace.name))
+      empty = empty + 1
+    elseif workspace_is_live(workspace.name) then
+      append_debug('restore all skip (deja vivant) name=' .. tostring(workspace.name))
+      live = live + 1
+    else
       restore_workspace(window, pane, workspace, 'new')
       restored = restored + 1
     end
   end
 
-  notify(window, 'Workspaces restaures: ' .. restored .. '/' .. #workspaces)
+  local details = {}
+
+  if live > 0 then
+    table.insert(details, live .. ' deja ouverts')
+  end
+
+  if empty > 0 then
+    table.insert(details, empty .. ' sans snapshot')
+  end
+
+  local message = 'Workspaces restaures: ' .. restored .. '/' .. #workspaces
+
+  if #details > 0 then
+    message = message .. ' (' .. table.concat(details, ', ') .. ')'
+  end
+
+  notify(window, message)
 end
 
 -- Demarre la boucle d'auto-sauvegarde (une seule fois par process, meme apres un

@@ -82,6 +82,21 @@ Le module `lua/workspaces.lua` capture/restaure les workspaces dans
   disque cote mux-server). La reprise est **manuelle et fiabilisee**, pas
   automatique : `ALT+Shift+R` (`M.restore_all_active`) relance tous les
   workspaces actifs, chacun en nouvelle fenetre, en ignorant ceux deja vivants.
+  Le decompte notifie distingue les deux raisons de saut (`deja ouverts`, `sans
+  snapshot`) : un `0/3` muet ne permettait pas de diagnostiquer.
+- **Vivacite d'un workspace** (`workspace_is_live` / `workspace_pane_count`) : un
+  workspace n'est vivant que s'il porte au moins un **pane**. Ne pas se fier a
+  `wezterm.mux.get_workspace_names()` (le nom survit sans aucune fenetre) ni a la
+  seule presence d'une fenetre ou d'un tab : une coquille vide bloquait alors sa
+  propre restauration (`ALT+Shift+R` renvoyait `0/3` en annoncant les workspaces
+  « deja ouverts »). `workspace_pane_count` journalise l'etat vu du mux
+  (`windows=/tabs=/panes=`) dans `workspaces-debug.log` : c'est le point d'entree
+  pour diagnostiquer un saut inattendu. Ne pas regresser.
+- **`workspace` obligatoire dans `mux.spawn_window`** : sans ce champ, la fenetre
+  spawnee atterrit dans le workspace **actif**, pas dans celui restaure — le
+  workspace cible restait une coquille vide pendant que son contenu s'ouvrait
+  ailleurs. `restore_workspace_in_new_window` passe donc `workspace` et `domain`.
+  Ne pas regresser.
 - **Auto-sauvegarde** (`M.start_auto_save`, demarree depuis `wezterm.lua`) :
   boucle `wezterm.time.call_after` toutes les `auto_save_interval` s (60). Elle ne
   rafraichit que les workspaces **deja presents** dans le registre (jamais de
@@ -98,6 +113,18 @@ Le module `lua/workspaces.lua` capture/restaure les workspaces dans
   presente en `last_command` dans le registre, la rejouer relancerait un
   mux-server dans un pane). Comparaison sur le 1er token, basename sans `.exe`,
   minuscule.
+- **Domaine de spawn depuis un selecteur** (`default_domain_spawn`) : le `pane`
+  passe au callback d'un `InputSelector` / `PromptInputLine` est le pane
+  **d'overlay** (`TermWizTerminalPane`), pas un pane du domaine `vibe`. Tout
+  `SwitchToWorkspace` declenche depuis un tel callback doit donc porter un
+  `spawn` avec `domain = 'DefaultDomain'` : sans lui, WezTerm resout
+  `CurrentPaneDomain` vers `TermWizTerminalDomain` et refuse le spawn (`cannot
+  spawn panes in a TermWizTerminalPane`, visible dans
+  `~/.local/share/wezterm/wezterm-gui.exe-log-*.txt`) — le workspace s'ouvrait
+  alors **sans aucun pane**. Attention : `SwitchToWorkspace` sans `spawn` du tout
+  n'est pas neutre, il retombe sur `SpawnCommand::default()`, donc sur
+  `CurrentPaneDomain`. Seul le cas « workspace deja vivant » peut s'en passer (il
+  ne spawne rien). Ne pas regresser.
 
 ## Documentation
 
@@ -136,3 +163,9 @@ Avant de considerer une modification terminee :
   un appel `wezterm.run_child_process` y est synchrone sur le thread GUI (~36 ms a
   chaque tick), ce qui rend l'interface moins reactive (jitter a l'ouverture d'un
   pane inclus).
+- Front-end de rendu (`lua/options.lua`) : forcer `config.front_end = "OpenGL"`. Le
+  defaut WebGpu sur Windows laisse par moments des regions non-repeintes apres un
+  split/resize/restauration de workspace (panes qui semblent s'arreter avant le bas,
+  framebuffer/bureau qui transparait), glitch rendu visible par le compositing
+  transparent (`window_background_opacity = 0.95`). Ne pas repasser a WebGpu sans
+  revalider ce cas.
