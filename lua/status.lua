@@ -1,4 +1,5 @@
 local wezterm = require 'wezterm'
+local domains = require 'lua/domains'
 local M = {}
 
 local palette = {
@@ -75,10 +76,16 @@ function M.apply(config)
   config.tab_bar_at_bottom = false
   config.show_new_tab_button_in_tab_bar = false
 
-  wezterm.on('update-status', function(window)
+  wezterm.on('update-status', function(window, pane)
     local overrides = window:effective_config()
     local c = colors_for_scheme(overrides.color_scheme)
     local workspace = active_workspace(window)
+    -- Domaine REEL du pane actif (et non le defaut de la fenetre) : c'est la
+    -- seule indication fiable de la machine ou tourne ce qu'on a sous les yeux,
+    -- workspaces locaux et distants pouvant cohabiter. Repli sur le defaut de la
+    -- fenetre quand le pane n'en expose pas (overlay, pane mort).
+    local domain = domains.pane_domain(pane) or domains.window_default(window)
+    local domain_fg = domains.is_remote(domain) and c.accent or c.muted
 
     window:set_left_status(wezterm.format {
       { Background = { Color = c.edge } },
@@ -88,6 +95,8 @@ function M.apply(config)
       { Foreground = { Color = c.fg } },
       { Attribute = { Intensity = 'Normal' } },
       { Text = workspace .. ' ' },
+      { Foreground = { Color = domain_fg } },
+      { Text = '[' .. domains.label(domain) .. '] ' },
     })
   end)
 

@@ -1,5 +1,6 @@
 local w = require 'wezterm'
 local workspaces = require 'lua/workspaces'
+local domains = require 'lua/domains'
 local M = {}
 
 local function is_vim(pane)
@@ -12,6 +13,31 @@ local direction_keys = {
   k = 'Up',
   l = 'Right',
 }
+
+-- Deblocage du suivi souris/focus reste actif apres la mort d'une appli TUI.
+--
+-- Sur un pane MUX (nos panes tournent sur le wezterm-mux-server de vibe), l'etat
+-- du terminal (modes DEC, suivi souris) vit COTE SERVEUR : pane:inject_output ne
+-- marche que sur les panes locaux, pas mux (cf. doc WezTerm). Le seul moyen fiable
+-- et portable (local comme mux) est de faire ECRIRE les sequences de reset par le
+-- shell : sa sortie repasse dans le parseur du terminal (cote serveur pour un mux)
+-- et remet les modes a zero. On envoie donc un printf via send_text.
+--
+-- \x15 (Ctrl-U) purge d'abord la ligne des octets parasites deja tapes ; les
+-- '\\033' sont des backslashs LITTERAUX destines au printf de bash (ESC), pas des
+-- echappements Lua ; \r valide la commande.
+local RESET_MOUSE_CMD = '\x15' .. "printf '" .. table.concat({
+  '\\033[?9l',    -- X10 mouse
+  '\\033[?1000l', -- suivi normal (clic)
+  '\\033[?1001l', -- surbrillance
+  '\\033[?1002l', -- button-event (drag)
+  '\\033[?1003l', -- any-event : le coupable du "souris = frappe clavier"
+  '\\033[?1004l', -- focus reporting (sequences [I / [O parasites)
+  '\\033[?1005l', -- extension UTF-8
+  '\\033[?1006l', -- extension SGR
+  '\\033[?1015l', -- extension urxvt
+  '\\033[?1016l', -- extension SGR pixel
+}) .. "'\r"
 
 local function split_nav(resize_or_move, key)
   return {
@@ -60,6 +86,14 @@ function M.apply(config)
       end),
     },
     { key = 'w', mods = 'LEADER', action = w.action.CloseCurrentPane { confirm = true } },
+    {
+      -- Deblocage du suivi souris reste actif apres la mort d'une appli TUI.
+      -- Fait ecrire les DECRST par le shell (cf. RESET_MOUSE_CMD) : fiable sur les
+      -- panes mux ou pane:inject_output n'a aucun effet. A utiliser au prompt shell.
+      key = 'm',
+      mods = 'LEADER',
+      action = w.action.SendString(RESET_MOUSE_CMD),
+    },
     split_nav('move', 'h'),
     split_nav('move', 'j'),
     split_nav('move', 'k'),
@@ -131,6 +165,16 @@ function M.apply(config)
       mods = 'ALT',
       action = w.action_callback(function(window, pane)
 	workspaces.choose_unarchive(window, pane)
+      end),
+    },
+    {
+      -- Bascule locale/distante du domaine par defaut de la fenetre courante.
+      -- N'affecte que les spawns sans contexte : les workspaces enregistres
+      -- gardent le domaine fige dans workspaces.json.
+      key = 'D',
+      mods = 'ALT',
+      action = w.action_callback(function(window, pane)
+	domains.prompt_switch_default(window, pane)
       end),
     },
     {

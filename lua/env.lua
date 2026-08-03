@@ -8,6 +8,9 @@ local defaults = {
     VIBE_DOMAIN = 'vibe',
     VIBE_ADDR = '10.91.16.171',
     VIBE_TLS_PORT = '8131',
+    -- Shell des panes LOCAUX. Vide = detection auto (pwsh.exe puis
+    -- powershell.exe sous Windows, shell de login ailleurs). Cf. lua/domains.lua.
+    SHELL_PROG = '',
 }
 
 local function trim(s)

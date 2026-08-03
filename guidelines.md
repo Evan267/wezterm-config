@@ -9,6 +9,10 @@ Structure actuelle :
 - `wezterm.lua` : point d'entree de la configuration.
 - `lua/env.lua` : chargement des variables depuis `.env` (avec defauts internes).
 - `lua/options.lua` : options visuelles et comportementales de base.
+- `lua/domains.lua` : domaines local/distant (`tls_clients`, `default_domain`,
+  selecteur de demarrage, bascule `ALT+SHIFT+D`).
+- `lua/notify.lua` : notifications ephemeres dans le statut droit, partagees par
+  `lua/workspaces.lua` et `lua/domains.lua`.
 - `lua/status.lua` : barre native WezTerm et titres d'onglets.
 - `lua/keys.lua` : raccourcis clavier personnalises et navigation de panneaux.
 - `.env` / `.env.example` : variables par-machine (domaine mux). `.env` est
@@ -20,6 +24,7 @@ Structure actuelle :
 La configuration active charge actuellement :
 
 - `lua/options.lua` pour les options generales.
+- `lua/domains.lua` pour les domaines local/distant.
 - `lua/status.lua` pour la barre native WezTerm.
 - `lua/keys.lua` pour les raccourcis clavier.
 
@@ -59,6 +64,59 @@ La navigation de panneaux utilise les touches Vim :
 - `META+h/j/k/l` : redimensionner le panneau actif.
 
 Le helper `split_nav` transmet les touches a Neovim si la variable utilisateur `IS_NVIM` vaut `true`. Cela permet de conserver une navigation coherente entre WezTerm et Neovim.
+
+## Domaines local / distant (`lua/domains.lua`)
+
+WezTerm peut lancer les panes sur ce PC (domaine integre `local`) ou sur le
+`wezterm-mux-server` de `vibe` (domaine mux TLS). Les deux cohabitent dans la
+meme instance. Points de maintenance :
+
+- **Ou vivent les domaines** : `tls_clients`, `default_domain` et l'evenement
+  `gui-startup` sont dans `lua/domains.lua`, plus dans `lua/options.lua`. Ce
+  dernier ne garde que les options visuelles/comportementales.
+- **`default_domain = 'local'`** : la premiere fenetre doit pouvoir s'ouvrir
+  meme si `vibe` est injoignable (VPN coupe, machine eteinte). L'ancien couple
+  `default_domain = vibe` + `default_gui_startup_args = { 'connect', vibe }`
+  rendait le demarrage dependant du reseau. Ne pas le retablir.
+- **Selecteur de demarrage** : `gui-startup` spawne une fenetre locale puis pose
+  la question « Ou travailler ? ». Le selecteur exige une **GuiWindow**, absente
+  au moment de `gui-startup` : on reessaie via `call_after`, avec `update-status`
+  en filet de securite (il fournit toujours une window valide). Drapeau one-shot
+  dans `wezterm.GLOBAL` pour ne pas reposer la question a chaque reload de config.
+- **Rattachement distant** (`ensure_attached`) : un domaine mux **detache refuse
+  tout spawn**. Toute restauration ou creation sur un domaine distant doit
+  appeler `domains.ensure_attached` AVANT de spawner, sinon le workspace s'ouvre
+  vide. Ne pas regresser.
+- **`domain:attach()` est asynchrone** : les fenetres distantes deja vivantes
+  sont reflechies avec un delai. `adopt_remote_session` attend brievement avant
+  de conclure « rien de vivant » et de convertir la fenetre d'amorcage en
+  fenetre distante. Garde-fou : ne jamais fermer la derniere fenetre GUI
+  (WezTerm quitterait) — d'ou le controle `#gui_windows() >= 2`.
+- **Override `default_domain` par fenetre** : `ALT+SHIFT+D` passe par
+  `window:set_config_overrides`. Tout autre `set_config_overrides` doit reporter
+  `default_domain`, sinon il efface silencieusement le choix. C'est le cas du
+  handler de bascule clair/sombre dans `lua/options.lua`. Ne pas regresser.
+- **`CurrentPaneDomain` pour tabs et splits** : `M.spawn_tab` et `M.split_pane`
+  epinglent explicitement `CurrentPaneDomain`. Sans cela, un tab ouvert dans un
+  workspace distant depuis une fenetre restee locale par defaut partait sur la
+  mauvaise machine.
+- **Domaines d'overlay** : un pane d'`InputSelector` / `PromptInputLine` repond
+  `TermWizTerminalDomain` a `get_domain_name()`. `domains.normalize` le filtre :
+  il ne doit jamais atterrir dans `workspaces.json` ni etre propose comme cible.
+- **Shell des panes locaux** (`M.local_shell_prog`, `config.default_prog`) : sous
+  Windows, le defaut WezTerm est `cmd.exe` ; on lance PowerShell directement.
+  Ordre de resolution : cle `SHELL_PROG` du `.env` si renseignee, sinon
+  detection `pwsh.exe` puis `powershell.exe` via `where.exe`, sinon
+  `powershell.exe` (present sur tout Windows). Hors Windows, `default_prog` est
+  laisse a WezTerm (shell de login).
+- **Detection du shell mise en cache** : elle passe par
+  `wezterm.run_child_process`, donc par un process enfant. Resultat memorise
+  dans `wezterm.GLOBAL` pour ne tourner qu'une fois par process et non a chaque
+  rechargement de config. Meme raisonnement que pour la detection de theme : ne
+  jamais deplacer cet appel dans un handler recurrent (`update-status`).
+- **`default_prog` ne vaut QUE pour le domaine local.** Ce que le mux-server
+  distant lance depend du `default_prog` de son propre `~/.wezterm.lua`, hors de
+  ce repo. Ne pas chercher a le forcer depuis le client (cf. VIBE_TLS_SETUP.md).
 
 ## Workspaces (persistance et archivage)
 
@@ -107,13 +165,32 @@ Le module `lua/workspaces.lua` capture/restaure les workspaces dans
   sauvegarde par un etat vide. Apres un redemarrage du mux-server, les panes
   morts sont filtres (pcall par pane dans `capture_pane`) et le snapshot devient
   vide : `snapshot_has_content` doit alors bloquer l'`upsert`. Ne pas regresser.
+- **Shell de rejeu par domaine** (`pane_spawn`) : `last_command` est relancee via
+  `<shell> -NoExit -Command <cmd>`. Le shell doit exister sur la machine DU PANE :
+  `powershell.exe` en dur pour un pane distant (on ne peut pas sonder vibe, et il
+  est present sur tout Windows), le shell local resolu pour un pane local. Hors
+  Windows, pas de rejeu par shell (`-NoExit -Command` est une syntaxe PowerShell) :
+  on retombe sur l'argv capture.
 - **Denylist de rejeu** (`non_replayable_commands` / `is_replayable_command`) :
   certaines `last_command` ne sont jamais rejouees au restore, soit triviales
   (`cd`, `clear`, `ls`, `exit`, …), soit dangereuses (`wezterm-mux-server` :
   presente en `last_command` dans le registre, la rejouer relancerait un
   mux-server dans un pane). Comparaison sur le 1er token, basename sans `.exe`,
   minuscule.
-- **Domaine de spawn depuis un selecteur** (`default_domain_spawn`) : le `pane`
+- **Domaine d'un workspace** : champ `domain` au niveau du workspace **et** de
+  chaque pane (capture via `pane:get_domain_name()`). Le pane prime, le
+  workspace sert de repli. C'est ce qui permet d'ouvrir un workspace distant
+  depuis une fenetre locale et inversement, sans rien basculer a la main.
+  `upsert_workspace` reporte `domain` depuis l'entree existante quand la capture
+  n'en remonte pas (panes morts apres un redemarrage du mux-server) : sans ce
+  report, un workspace distant reviendrait en local a la restauration suivante.
+  Meme invariant que pour `archived_at`. Ne pas regresser.
+- **Migration** (`migrate_domains`, appelee par `load_registry`) : les entrees
+  sans champ `domain` datent d'avant le multi-domaines et ne pouvaient venir que
+  du mux distant ; elles sont estampillees `domains.REMOTE` et reecrites une
+  fois. Sans cette migration, elles seraient restaurees en local (repli
+  `DefaultDomain`, desormais `local`).
+- **Domaine de spawn depuis un selecteur** (`workspace_domain_spawn`) : le `pane`
   passe au callback d'un `InputSelector` / `PromptInputLine` est le pane
   **d'overlay** (`TermWizTerminalPane`), pas un pane du domaine `vibe`. Tout
   `SwitchToWorkspace` declenche depuis un tel callback doit donc porter un
@@ -124,7 +201,9 @@ Le module `lua/workspaces.lua` capture/restaure les workspaces dans
   alors **sans aucun pane**. Attention : `SwitchToWorkspace` sans `spawn` du tout
   n'est pas neutre, il retombe sur `SpawnCommand::default()`, donc sur
   `CurrentPaneDomain`. Seul le cas « workspace deja vivant » peut s'en passer (il
-  ne spawne rien). Ne pas regresser.
+  ne spawne rien). Le domaine passe est desormais **celui du workspace** et non
+  `DefaultDomain` : le defaut varie par fenetre depuis `ALT+SHIFT+D`, un
+  workspace doit se restaurer la ou il a ete capture. Ne pas regresser.
 
 ## Documentation
 

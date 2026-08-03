@@ -1,17 +1,14 @@
 local wezterm = require 'wezterm'
+local domains = require 'lua/domains'
+local notifications = require 'lua/notify'
 local M = {}
 
 local registry_path = wezterm.config_dir .. '/workspaces.json'
 local debug_path = wezterm.config_dir .. '/workspaces-debug.log'
 local snapshot_version = 1
-local notification_duration = 2500
-local error_notification_duration = 5000
--- Notification courante affichee dans le statut droit, avec son horodatage
--- d'expiration. L'effacement est pilote par l'evenement update-status (qui
--- recoit une window valide a chaque tick) et non par un timer a window
--- capturee : ce dernier pouvait echouer silencieusement et laisser le message
--- affiche indefiniment.
-local active_notification = nil
+
+local notify = notifications.info
+local notify_error = notifications.error
 
 local shell_names = {
   bash = true,
@@ -82,47 +79,6 @@ local function append_debug(message)
   file:close()
 end
 
-local function render_notification(window)
-  pcall(function()
-    window:set_right_status(active_notification and active_notification.text or '')
-  end)
-end
-
-local function notify(window, message, duration)
-  duration = duration or notification_duration
-
-  active_notification = {
-    text = wezterm.format {
-      { Attribute = { Intensity = 'Bold' } },
-      { Foreground = { AnsiColor = 'Aqua' } },
-      { Text = ' ' .. message .. ' ' },
-    },
-    -- os.time() est en secondes et update-status tourne toutes les 1000 ms : une
-    -- resolution a la seconde suffit. Arrondi au superieur, minimum 1 s.
-    expiry = os.time() + math.max(1, math.ceil(duration / 1000)),
-  }
-
-  render_notification(window)
-end
-
-local function notify_error(window, message)
-  notify(window, message, error_notification_duration)
-end
-
--- Efface la notification une fois son delai ecoule. Pilote par update-status
--- pour disposer d'une window valide a chaque tick (~1 s).
-wezterm.on('update-status', function(window)
-  if not active_notification then
-    return
-  end
-
-  if os.time() >= active_notification.expiry then
-    active_notification = nil
-  end
-
-  render_notification(window)
-end)
-
 local function normalize_registry(value)
   if type(value) ~= 'table' then
     return { workspaces = {} }
@@ -133,6 +89,28 @@ local function normalize_registry(value)
   end
 
   return value
+end
+
+local function save_registry(registry)
+  return write_file(registry_path, wezterm.json_encode(normalize_registry(registry)))
+end
+
+-- Migration des entrees anterieures a la gestion multi-domaines : elles n'ont
+-- pas de champ `domain` et ont toutes ete capturees sur le mux distant (seul
+-- domaine existant alors). Sans ce report, elles se restaureraient en local
+-- (repli 'DefaultDomain', desormais local). Idempotente : reecrite une seule
+-- fois, ensuite chaque upsert porte le domaine.
+local function migrate_domains(registry)
+  local changed = false
+
+  for _, workspace in ipairs(registry.workspaces) do
+    if not domains.normalize(workspace.domain) then
+      workspace.domain = domains.REMOTE
+      changed = true
+    end
+  end
+
+  return changed
 end
 
 local function load_registry()
@@ -149,11 +127,14 @@ local function load_registry()
     return { workspaces = {} }
   end
 
-  return normalize_registry(decoded)
-end
+  local registry = normalize_registry(decoded)
 
-local function save_registry(registry)
-  return write_file(registry_path, wezterm.json_encode(normalize_registry(registry)))
+  if migrate_domains(registry) then
+    append_debug('migration domaine appliquee sur ' .. registry_path)
+    save_registry(registry)
+  end
+
+  return registry
 end
 
 local function basename(path)
@@ -493,6 +474,13 @@ local function upsert_workspace(name, snapshot)
       snapshot.archived_at = existing.archived_at
     end
 
+    -- Meme raisonnement pour le domaine : une capture faite sur des panes morts
+    -- (mux-server redemarre) ne remonte aucun domaine. Retomber sur le defaut
+    -- ramenerait un workspace distant en local a la restauration suivante.
+    if domains.normalize(existing.domain) and not domains.normalize(snapshot.domain) then
+      snapshot.domain = existing.domain
+    end
+
     for key in pairs(existing) do
       existing[key] = nil
     end
@@ -509,7 +497,9 @@ local function upsert_workspace(name, snapshot)
   return saved
 end
 
-local function pane_spawn(pane_snapshot)
+-- `fallback_domain` : domaine du workspace, utilise quand le pane n'en porte pas
+-- (snapshot anterieur au multi-domaines, ou capture sur pane mort).
+local function pane_spawn(pane_snapshot, fallback_domain)
   if type(pane_snapshot) ~= 'table' then
     return nil
   end
@@ -517,7 +507,12 @@ local function pane_spawn(pane_snapshot)
   local cwd = normalize_remote_path(pane_snapshot.cwd)
   local argv = copy_array(pane_snapshot.argv)
   local command = type(pane_snapshot.last_command) == 'string' and pane_snapshot.last_command or nil
+  local domain = domains.normalize(pane_snapshot.domain) or domains.normalize(fallback_domain)
   local spawn = {}
+
+  if domain then
+    spawn.domain = domains.spawn_domain(domain)
+  end
 
   if argv and (argv[1]:match('^%-%-') or pane_snapshot.title == 'wslhost.exe'
     or non_replayable_commands[normalized_command_word(argv[1]) or '']) then
@@ -532,15 +527,27 @@ local function pane_spawn(pane_snapshot)
     spawn.cwd = cwd
   end
 
-  if command then
-    -- relance la derniere commande puis garde un shell interactif (le profil
-    -- Windows PowerShell de vibe charge le workspace tracker)
-    spawn.args = { 'powershell.exe', '-NoExit', '-Command', command }
+  -- Shell utilise pour relancer `last_command` en gardant un shell interactif
+  -- (son profil PowerShell charge le workspace tracker). Il doit exister sur la
+  -- machine du pane, d'ou la distinction local/distant : on ne peut pas sonder
+  -- ce qui est installe sur vibe, et powershell.exe est present sur tout
+  -- Windows. Hors Windows, pas de rejeu par shell : `-NoExit -Command` est une
+  -- syntaxe PowerShell, on retombe sur l'argv capture.
+  local replay_shell = nil
+
+  if domains.is_remote(domain) then
+    replay_shell = 'powershell.exe'
+  elseif domains.is_windows() then
+    replay_shell = domains.local_shell_prog()
+  end
+
+  if command and replay_shell then
+    spawn.args = { replay_shell, '-NoExit', '-Command', command }
   elseif argv and not is_shell(argv) then
     spawn.args = argv
   end
 
-  if spawn.cwd or spawn.args then
+  if spawn.cwd or spawn.args or spawn.domain then
     return spawn
   end
 
@@ -575,17 +582,19 @@ local function first_leaf_pane(node)
   return {}
 end
 
--- Spawn epingle sur le domaine par defaut (config.default_domain = vibe).
+-- Spawn epingle sur le domaine DU WORKSPACE (local ou distant selon ce qui a ete
+-- capture), avec repli sur le domaine par defaut de la fenetre.
 --
--- Indispensable des qu'un SwitchToWorkspace est declenche depuis le callback d'un
--- selecteur ou d'un prompt : le `pane` fourni a ce callback est le pane d'OVERLAY
--- (TermWizTerminalPane). Sans `domain`, WezTerm resout `CurrentPaneDomain` vers
--- `TermWizTerminalDomain` et refuse le spawn ("cannot spawn panes in a
--- TermWizTerminalPane") : le workspace s'ouvrait alors sans aucun pane.
+-- Un domaine explicite est indispensable des qu'un SwitchToWorkspace est declenche
+-- depuis le callback d'un selecteur ou d'un prompt : le `pane` fourni a ce callback
+-- est le pane d'OVERLAY (TermWizTerminalPane). Sans `domain`, WezTerm resout
+-- `CurrentPaneDomain` vers `TermWizTerminalDomain` et refuse le spawn ("cannot
+-- spawn panes in a TermWizTerminalPane") : le workspace s'ouvrait alors sans
+-- aucun pane.
 --
 -- Table neuve a chaque appel : merge_spawn_options ecrit dans `base`.
-local function default_domain_spawn()
-  return { domain = 'DefaultDomain' }
+local function workspace_domain_spawn(workspace)
+  return { domain = domains.spawn_domain(workspace and workspace.domain) }
 end
 
 local function merge_spawn_options(base, spawn)
@@ -750,6 +759,7 @@ local function capture_pane(item)
   local tracked_cwd = pane_user_var(p, 'WEZTERM_WORKSPACE_CWD')
   local last_command = pane_user_var(p, 'WEZTERM_WORKSPACE_LAST_COMMAND')
   local cwd = tracked_cwd or cwd_from_title(title) or current_working_dir(p)
+  local domain = domains.pane_domain(p)
 
   if argv and (argv[1]:match('^%-%-') or title == 'wslhost.exe') then
     argv = nil
@@ -761,6 +771,7 @@ local function capture_pane(item)
     argv = argv,
     command = command,
     last_command = last_command,
+    domain = domain,
     title = title,
     x = rect.x,
     y = rect.y,
@@ -768,6 +779,28 @@ local function capture_pane(item)
     rows = rect.rows,
     is_active = item.is_active == true,
   }
+end
+
+-- Domaine du workspace : celui du pane actif, sinon le premier domaine trouve
+-- parmi les panes captures. Un workspace peut theoriquement melanger les
+-- domaines (chaque pane garde le sien) ; ce champ sert de repli et d'etiquette
+-- dans les selecteurs.
+local function snapshot_domain(tabs, active_pane)
+  local from_active = active_pane and domains.pane_domain(active_pane)
+
+  if from_active then
+    return from_active
+  end
+
+  for _, tab in ipairs(tabs) do
+    for _, pane in ipairs(tab.panes) do
+      if domains.normalize(pane.domain) then
+        return pane.domain
+      end
+    end
+  end
+
+  return nil
 end
 
 local function capture_mux_window(mux_window, active_pane)
@@ -807,6 +840,7 @@ local function capture_mux_window(mux_window, active_pane)
     version = snapshot_version,
     cwd = active_pane and (pane_user_var(active_pane, 'WEZTERM_WORKSPACE_CWD') or current_working_dir(active_pane))
       or first_pane(tabs[1]).cwd,
+    domain = snapshot_domain(tabs, active_pane),
     tabs = tabs,
     saved_at = os.date('!%Y-%m-%dT%H:%M:%SZ'),
   }
@@ -992,12 +1026,12 @@ local function build_tab_layout(tab_snapshot)
   return build_layout(panes)
 end
 
-local function layout_pane_spawn(pane_snapshot)
-  return pane_spawn(pane_snapshot)
+local function layout_pane_spawn(pane_snapshot, workspace)
+  return pane_spawn(pane_snapshot, workspace and workspace.domain)
 end
 
-local function first_layout_spawn(_, _, layout)
-  return layout_pane_spawn(first_leaf_pane(layout))
+local function first_layout_spawn(workspace, _, layout)
+  return layout_pane_spawn(first_leaf_pane(layout), workspace)
 end
 
 local function apply_layout(target_pane, node, workspace, tab_index)
@@ -1015,7 +1049,7 @@ local function apply_layout(target_pane, node, workspace, tab_index)
       direction = node.direction,
       size = percent / 100,
     }
-    local spawn = layout_pane_spawn(first_leaf_pane(node.second))
+    local spawn = layout_pane_spawn(first_leaf_pane(node.second), workspace)
 
     if spawn then
       for key, value in pairs(spawn) do
@@ -1032,7 +1066,7 @@ local function apply_layout(target_pane, node, workspace, tab_index)
   if node.kind == 'stack' then
     for index = 2, #node.panes do
       local split_args = { direction = 'Bottom', size = 0.5 }
-      local spawn = layout_pane_spawn(node.panes[index])
+      local spawn = layout_pane_spawn(node.panes[index], workspace)
 
       if spawn then
         for key, value in pairs(spawn) do
@@ -1054,7 +1088,7 @@ local function restore_workspace_in_new_window(window, pane, workspace)
   local ok, first_mux_tab, first_mux_pane, mux_window = pcall(function()
     return wezterm.mux.spawn_window(merge_spawn_options({
       workspace = workspace.name,
-      domain = 'DefaultDomain',
+      domain = domains.spawn_domain(workspace.domain),
       position = { origin = 'ActiveScreen', x = 80, y = 80 },
     }, first_layout_spawn(workspace, 1, first_layout)))
   end)
@@ -1165,7 +1199,7 @@ local function restore_workspace_in_current_window(window, pane, workspace)
     wezterm.action.SwitchToWorkspace {
       name = workspace.name,
       spawn = merge_spawn_options(
-        default_domain_spawn(),
+        workspace_domain_spawn(workspace),
         first_layout_spawn(workspace, 1, build_tab_layout(first_tab))
       ),
     },
@@ -1179,7 +1213,19 @@ end
 
 local function restore_workspace(window, pane, workspace, mode)
   mode = mode or 'current'
-  append_debug('restore start name=' .. tostring(workspace.name) .. ' mode=' .. tostring(mode))
+  append_debug('restore start name=' .. tostring(workspace.name)
+    .. ' mode=' .. tostring(mode) .. ' domain=' .. tostring(workspace.domain))
+
+  -- Un domaine mux detache refuse tout spawn : le rattacher AVANT de restaurer,
+  -- sinon le workspace s'ouvre vide. Le premier workspace distant ouvert depuis
+  -- une session locale passe systematiquement par ici.
+  local attached, attach_err = domains.ensure_attached(workspace.domain)
+
+  if not attached then
+    append_debug('restore attach failed name=' .. tostring(workspace.name) .. ' err=' .. tostring(attach_err))
+    notify_error(window, 'Domaine ' .. domains.label(workspace.domain) .. ' injoignable: ' .. workspace.name)
+    return
+  end
 
   if mode == 'new' then
     if type(workspace.tabs) == 'table' and #workspace.tabs > 0 then
@@ -1191,7 +1237,9 @@ local function restore_workspace(window, pane, workspace, mode)
     end
 
     local ok, err = pcall(function()
-      wezterm.mux.spawn_window({})
+      wezterm.mux.spawn_window(merge_spawn_options({
+        workspace = workspace.name,
+      }, workspace_domain_spawn(workspace)))
     end)
 
     if ok then
@@ -1217,7 +1265,7 @@ local function restore_workspace(window, pane, workspace, mode)
     window:perform_action(
       wezterm.action.SwitchToWorkspace {
         name = workspace.name,
-        spawn = default_domain_spawn(),
+        spawn = workspace_domain_spawn(workspace),
       },
       pane
     )
@@ -1235,6 +1283,10 @@ local function restore_workspace(window, pane, workspace, mode)
   append_debug('restore done name=' .. tostring(workspace.name))
 end
 
+-- Nom puis domaine : c'est a la creation qu'on decide si le workspace vit sur ce
+-- PC ou sur le serveur. Le domaine n'est pas devine depuis le pane courant, sinon
+-- creer un workspace distant depuis une fenetre locale imposerait d'y basculer
+-- d'abord. Il sera fige dans le registre au premier ALT+r.
 function M.prompt_new_workspace(window, pane)
   window:perform_action(
     wezterm.action.PromptInputLine {
@@ -1244,12 +1296,29 @@ function M.prompt_new_workspace(window, pane)
         { Text = 'Nommer le nouveau Workspace: ' },
       },
       action = wezterm.action_callback(function(win, p, line)
-        if line and line ~= '' then
-          win:perform_action(wezterm.action.SwitchToWorkspace {
-            name = line,
-            spawn = default_domain_spawn(),
-          }, p)
+        if not line or line == '' then
+          return
         end
+
+        -- Le pane d'overlay du prompt vient d'etre ferme : repartir du pane
+        -- actif de la fenetre pour ouvrir le selecteur suivant.
+        local host_pane = win:active_pane() or p
+
+        domains.choose(win, host_pane, 'Domaine du workspace ' .. line, function(w, sel_pane, domain)
+          local ok, err = domains.ensure_attached(domain)
+
+          if not ok then
+            notify_error(w, 'Domaine ' .. domains.label(domain) .. ' injoignable: ' .. tostring(err))
+            return
+          end
+
+          w:perform_action(wezterm.action.SwitchToWorkspace {
+            name = line,
+            spawn = { domain = domains.spawn_domain(domain) },
+          }, sel_pane)
+
+          notify(w, 'Workspace ' .. line .. ' [' .. domains.label(domain) .. ']')
+        end)
       end),
     },
     pane
@@ -1257,10 +1326,11 @@ function M.prompt_new_workspace(window, pane)
 end
 
 function M.split_pane(window, pane, direction)
-  -- Spawn natif dans le domaine courant (mux-server vibe): la persistance est
-  -- assuree cote serveur, plus besoin de session tmux.
+  -- `CurrentPaneDomain` explicite : un split doit rester sur la machine du pane
+  -- qu'il divise. Sur le domaine distant, la persistance reste assuree cote
+  -- mux-server (plus besoin de session tmux).
   local ok, err = pcall(function()
-    pane:split { direction = direction }
+    pane:split { direction = direction, domain = 'CurrentPaneDomain' }
   end)
 
   if not ok then
@@ -1271,8 +1341,11 @@ end
 
 function M.spawn_tab(window)
   local mux_window = window:mux_window()
+  -- `CurrentPaneDomain` et non le defaut de la fenetre : dans un workspace
+  -- distant ouvert depuis une fenetre restee locale par defaut, un nouveau tab
+  -- doit suivre le workspace, pas le defaut.
   local ok, err = pcall(function()
-    mux_window:spawn_tab {}
+    mux_window:spawn_tab { domain = 'CurrentPaneDomain' }
   end)
 
   if not ok then
@@ -1307,7 +1380,8 @@ function M.save_current(window, pane, name)
   end
 
   local tab_count = type(snapshot.tabs) == 'table' and #snapshot.tabs or 0
-  notify(window, 'Workspace enregistre: ' .. workspace .. ' (' .. tab_count .. ' tabs)')
+  notify(window, 'Workspace enregistre: ' .. workspace
+    .. ' [' .. domains.label(snapshot.domain) .. '] (' .. tab_count .. ' tabs)')
   return true
 end
 
@@ -1362,6 +1436,13 @@ function M.prompt_rename_active_tab(window, pane)
   )
 end
 
+-- Libelle de selecteur : nom + domaine. Le domaine est la seule facon de
+-- distinguer d'un coup d'oeil un workspace local d'un workspace distant, et il
+-- reste filtrable au clavier (recherche fuzzy sur « vibe » ou « local »).
+local function workspace_choice_label(workspace, suffix)
+  return workspace.name .. '  [' .. domains.label(workspace.domain) .. ']' .. (suffix or '')
+end
+
 function M.choose_registered(window, pane, mode)
   local registry = load_registry()
   local choices = {}
@@ -1374,7 +1455,7 @@ function M.choose_registered(window, pane, mode)
   for _, workspace in ipairs(list_workspaces(registry, 'active')) do
     table.insert(choices, {
       id = workspace.name,
-      label = workspace.name,
+      label = workspace_choice_label(workspace),
     })
   end
 
@@ -1416,7 +1497,7 @@ function M.choose_delete_registered(window, pane)
     local suffix = is_archived(workspace) and '  (archive)' or ''
     table.insert(choices, {
       id = workspace.name,
-      label = workspace.name .. suffix,
+      label = workspace_choice_label(workspace, suffix),
     })
   end
 
@@ -1461,7 +1542,7 @@ function M.choose_archive(window, pane)
   for _, workspace in ipairs(list_workspaces(registry, 'active')) do
     table.insert(choices, {
       id = workspace.name,
-      label = workspace.name,
+      label = workspace_choice_label(workspace),
     })
   end
 
@@ -1506,7 +1587,7 @@ function M.choose_unarchive(window, pane)
   for _, workspace in ipairs(list_workspaces(registry, 'archived')) do
     table.insert(choices, {
       id = workspace.name,
-      label = workspace.name,
+      label = workspace_choice_label(workspace),
     })
   end
 
@@ -1578,7 +1659,7 @@ function M.restore_all_active(window, pane)
     return
   end
 
-  local restored, live, empty = 0, 0, 0
+  local restored, live, empty, unreachable = 0, 0, 0, 0
 
   for _, workspace in ipairs(workspaces) do
     if type(workspace.tabs) ~= 'table' or #workspace.tabs == 0 then
@@ -1587,6 +1668,12 @@ function M.restore_all_active(window, pane)
     elseif workspace_is_live(workspace.name) then
       append_debug('restore all skip (deja vivant) name=' .. tostring(workspace.name))
       live = live + 1
+    elseif not domains.ensure_attached(workspace.domain) then
+      -- Serveur eteint ou VPN coupe : les workspaces locaux doivent quand meme
+      -- se restaurer, donc on saute l'entree au lieu d'interrompre la boucle.
+      append_debug('restore all skip (domaine injoignable) name=' .. tostring(workspace.name)
+        .. ' domain=' .. tostring(workspace.domain))
+      unreachable = unreachable + 1
     else
       restore_workspace(window, pane, workspace, 'new')
       restored = restored + 1
@@ -1601,6 +1688,10 @@ function M.restore_all_active(window, pane)
 
   if empty > 0 then
     table.insert(details, empty .. ' sans snapshot')
+  end
+
+  if unreachable > 0 then
+    table.insert(details, unreachable .. ' domaine injoignable')
   end
 
   local message = 'Workspaces restaures: ' .. restored .. '/' .. #workspaces

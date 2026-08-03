@@ -18,18 +18,22 @@ Les conventions de code, de maintenance et de structure sont décrites dans
   machine distante `vibe`. **À maintenir à jour dès que change la configuration
   du domaine** : variables `VIBE_DOMAIN` / `VIBE_ADDR` / `VIBE_TLS_PORT` (définies
   dans `.env`, modèle `.env.example`, chargées par `lua/env.lua`), le bloc
-  `tls_clients` et la PKI (`~/.wezterm-tls`) dans `lua/options.lua`, ou toute
+  `tls_clients` et la PKI (`~/.wezterm-tls`) dans `lua/domains.lua`, ou toute
   étape de mise en place (pare-feu, redémarrage du mux-server).
 
 ## Spécificités multi-machines
 
-Ce repo est la config **du client** (le poste local). Il se connecte en TLS
-direct au `wezterm-mux-server` de `vibe` (`WS871674`), qui tourne avec sa propre
-config `~/.wezterm.lua` (hors de ce repo, bloc `tls_servers`). `lua/options.lua`
-ne se branche plus selon `wezterm.hostname()` : il déclare uniquement
-`tls_clients`. Tout changement du domaine mux (port, IP, certificats dans
-`~/.wezterm-tls`) doit rester cohérent avec le `~/.wezterm.lua` de vibe. Voir
-`VIBE_TLS_SETUP.md`.
+Ce repo est la config **du client** (le poste local). Il peut faire tourner les
+panes sur ce PC (domaine intégré `local`) **ou** sur le `wezterm-mux-server` de
+`vibe` (`WS871674`), en TLS direct ; ce serveur tourne avec sa propre config
+`~/.wezterm.lua` (hors de ce repo, bloc `tls_servers`). Le choix se fait au
+démarrage (sélecteur « Où travailler ? »), par workspace (champ `domain` dans
+`workspaces.json`) et par fenêtre (`ALT+SHIFT+D`). Le domaine par défaut est
+`local` : l'ouverture de WezTerm ne doit jamais dépendre de la joignabilité du
+serveur. Tout est déclaré dans `lua/domains.lua` (`tls_clients`,
+`default_domain`, `gui-startup`) — plus dans `lua/options.lua`. Tout changement
+du domaine mux (port, IP, certificats dans `~/.wezterm-tls`) doit rester cohérent
+avec le `~/.wezterm.lua` de vibe. Voir `VIBE_TLS_SETUP.md`.
 
 Ne jamais versionner l'état runtime ni la config par-machine (`workspaces.json`,
 `workspaces-debug.log`, `.env`) : ils sont dans `.gitignore`. Seul `.env.example`

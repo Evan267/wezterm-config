@@ -1,12 +1,7 @@
 local wezterm = require 'wezterm'
-local env = require('lua/env')
 local M = {}
 
 local DYNAMIC_COLOR_SCHEME_EVENT_VERSION = 6
--- Variables du domaine mux chargees depuis `.env` (cf. lua/env.lua, .env.example).
-local VIBE_DOMAIN = env.VIBE_DOMAIN     -- nom du domaine TLS cote client
-local VIBE_ADDR = env.VIBE_ADDR         -- IP de vibe : le nom court WS871674 ne resout pas toujours hors interne (VPN)
-local VIBE_TLS_PORT = env.VIBE_TLS_PORT -- port d'ecoute TLS du wezterm-mux-server sur vibe
 
 local function color_scheme_for_appearance(appearance)
     appearance = appearance or 'Dark'
@@ -50,7 +45,12 @@ function M.apply_dynamic_color_scheme()
 
         if color_scheme and color_scheme ~= wezterm.GLOBAL.dynamic_color_scheme then
             wezterm.GLOBAL.dynamic_color_scheme = color_scheme
-            window:set_config_overrides({})
+            -- On repart d'overrides vides pour forcer la relecture du scheme,
+            -- MAIS `default_domain` doit survivre : c'est lui qui porte le choix
+            -- local/distant de la fenetre (ALT+SHIFT+D, cf. lua/domains.lua).
+            -- L'effacer renvoyait silencieusement la fenetre sur le domaine global.
+            local overrides = window:get_config_overrides() or {}
+            window:set_config_overrides({ default_domain = overrides.default_domain })
             window:perform_action(wezterm.action.ReloadConfiguration, pane)
         end
     end)
@@ -63,32 +63,8 @@ function M.apply(config)
     config.font = wezterm.font('JetBrains Mono')
     config.status_update_interval = 1000
     config.exit_behavior = 'Close'
-    -- 'vibe' = machine distante (10.91.16.171 / WS871674) avec un wezterm-mux-server
-    -- persistant (lance par tache planifiee, cf. VIBE_TLS_SETUP.md). Ce repo est la
-    -- config du CLIENT uniquement ; le serveur a sa propre config ~/.wezterm.lua.
-    --
-    -- TLS direct avec certificats explicites. PAS de bootstrap_via_ssh : sur Windows il
-    -- ne garde pas le mux-server vivant (process tue a la fermeture de la session SSH).
-    -- PKI partagee, generee a la main, hors repo dans ~/.wezterm-tls (ca/client/server).
-    local pki = wezterm.home_dir .. '\\.wezterm-tls\\'
-    config.tls_clients = {
-        {
-            name = VIBE_DOMAIN,
-            -- Cible TLS par IP : le nom court WS871674 ne se resout pas toujours hors interne.
-            remote_address = VIBE_ADDR .. ':' .. VIBE_TLS_PORT,
-            pem_cert = pki .. 'client.crt',
-            pem_private_key = pki .. 'client.key',
-            -- pas de pem_ca (cf. ~/.wezterm.lua serveur) : pem_root_certs suffit comme
-            -- trust store pour valider le certificat serveur.
-            pem_root_certs = { pki .. 'ca.pem' },
-            -- Connexion par IP : le CN ne matche pas le nom, on desactive la verif du
-            -- hostname (le chiffrement et l'auth mutuelle par certificat restent actifs).
-            accept_invalid_hostnames = true,
-        },
-    }
-    config.default_domain = VIBE_DOMAIN
-    -- Au lancement, RATTACHER le mux-server vibe existant au lieu d'une fenetre vide.
-    config.default_gui_startup_args = { 'connect', VIBE_DOMAIN }
+    -- Domaines (tls_clients, default_domain, selecteur de demarrage) : voir
+    -- lua/domains.lua. Ils ne sont plus declares ici.
 
     config.window_decorations = "RESIZE"
     -- Front-end OpenGL force : le defaut WebGpu sur Windows laisse par moments des

@@ -24,7 +24,7 @@ vivant.
   (il ne survit pas au reboot) et configuré par son **propre** `~/.wezterm.lua`
   (hors de ce repo) qui déclare un `tls_servers` écoutant le port TLS.
 - **Poste local** = client. **Ce repo est la config du client uniquement** :
-  `lua/options.lua` déclare un `tls_clients` qui se connecte au domaine `vibe`.
+  `lua/domains.lua` déclare un `tls_clients` qui se connecte au domaine `vibe`.
   Il n'y a plus de branchement par `wezterm.hostname()`.
 - **PKI partagée, générée à la main**, hors repo, dans `~/.wezterm-tls` des deux
   côtés (ni versionnée dans git, ni regénérée par WezTerm) :
@@ -36,7 +36,7 @@ vivant.
   chiffrement et l'authentification mutuelle par certificat restent actifs).
 
 Variables définies dans `.env` (modèle versionné : `.env.example`) et chargées
-par `lua/env.lua`, puis consommées dans `lua/options.lua`. Le `.env` est dans
+par `lua/env.lua`, puis consommées dans `lua/domains.lua`. Le `.env` est dans
 `.gitignore` : chaque machine a le sien (copier `.env.example`). Si une clé
 manque, `lua/env.lua` retombe sur un défaut interne.
 
@@ -45,8 +45,21 @@ manque, `lua/env.lua` retombe sur un défaut interne.
 | `VIBE_DOMAIN` | `vibe` | nom du domaine côté client |
 | `VIBE_ADDR` | `10.91.16.171` | IP de la machine vibe (`WS871674`) |
 | `VIBE_TLS_PORT` | `8131` | port d'écoute TLS du mux-server |
+| `SHELL_PROG` | *(vide)* | shell des panes **locaux** ; vide = auto (`pwsh.exe` puis `powershell.exe`) |
 
-Les chemins de la PKI sont construits dans `lua/options.lua` à partir de
+> `SHELL_PROG` / `default_prog` n'ont **aucun effet sur les panes de vibe** : un
+> domaine mux fait naître ses process côté serveur, donc avec le `default_prog`
+> du `~/.wezterm.lua` **de vibe**. Pour que les panes distants ouvrent PowerShell
+> plutôt que `cmd.exe` (défaut WezTerm sous Windows), ajouter côté vibe :
+>
+> ```lua
+> -- ~/.wezterm.lua sur vibe, à côté du bloc tls_servers
+> config.default_prog = { 'pwsh.exe' }  -- ou 'powershell.exe' si PowerShell 7 absent
+> ```
+>
+> Puis redémarrer le `wezterm-mux-server` (les panes déjà ouverts ne changent pas).
+
+Les chemins de la PKI sont construits dans `lua/domains.lua` à partir de
 `wezterm.home_dir` (`~/.wezterm-tls\client.crt`, `client.key`, `ca.pem`).
 
 ## Procédure de mise en place
@@ -104,8 +117,8 @@ Les chemins de la PKI sont construits dans `lua/options.lua` à partir de
 
 ## CA du proxy pour les outils Node (panes vibe)
 
-Indépendant du mux TLS, mais à régler **sur vibe** car les panes y tournent
-(`default_domain = vibe`). Le réseau THK passe par un proxy Fortinet qui fait de
+Indépendant du mux TLS, mais à régler **sur vibe** pour les panes qui y tournent
+(workspaces dont le champ `domain` vaut `vibe`). Le réseau THK passe par un proxy Fortinet qui fait de
 l'inspection SSL : les outils **Node** (claude, npm, dev servers…) doivent faire
 confiance à sa CA, sinon ils échouent en HTTPS ou polluent l'ouverture de
 workspace.
@@ -169,7 +182,7 @@ inutile de toucher au mux-server.
 
 - **Mismatch de hostname sur le certificat** → vérifier que
   `accept_invalid_hostnames = true` est bien présent dans le bloc `tls_clients`
-  de `lua/options.lua` (la cible étant une IP, le CN ne matche pas).
+  de `lua/domains.lua` (la cible étant une IP, le CN ne matche pas).
 - **Connexion TLS refusée** → vérifier dans l'ordre : le pare-feu (port 8131
   entrant sur vibe), que le `wezterm-mux-server` tourne bien sur vibe, et que son
   `~/.wezterm.lua` déclare bien `tls_servers` sur le bon port.
