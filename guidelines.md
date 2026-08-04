@@ -15,6 +15,8 @@ Structure actuelle :
   `lua/workspaces.lua` et `lua/domains.lua`.
 - `lua/status.lua` : barre native WezTerm et titres d'onglets.
 - `lua/keys.lua` : raccourcis clavier personnalises et navigation de panneaux.
+- `shell/wezterm.ps1` : integration shell des panes locaux (emission OSC 7),
+  chargee par `lua/domains.lua` via `default_prog`.
 - `.env` / `.env.example` : variables par-machine (domaine mux). `.env` est
   gitignore ; `.env.example` est le modele versionne. Voir `VIBE_TLS_SETUP.md`.
 - `WEZTERM_SHORTCUTS.md` : aide-memoire utilisateur des raccourcis.
@@ -109,6 +111,24 @@ meme instance. Points de maintenance :
   detection `pwsh.exe` puis `powershell.exe` via `where.exe`, sinon
   `powershell.exe` (present sur tout Windows). Hors Windows, `default_prog` est
   laisse a WezTerm (shell de login).
+- **Heritage du repertoire courant** (`shell/wezterm.ps1`, `M.local_prog`) : un
+  split ou un nouvel onglet local repartait du HOME au lieu du repertoire du
+  pane courant. WezTerm ne connait le cwd d'un pane que si le shell le lui
+  annonce par **OSC 7** ; aucun profil PowerShell local n'existait pour le
+  faire (sur `vibe`, c'est le profil du serveur qui s'en charge). Deux pieges a
+  ne pas reintroduire :
+  - Le repli « lire le cwd du process » (`get_foreground_process_info().cwd`)
+    ne marche PAS ici : sous PowerShell, `Set-Location` ne modifie pas le
+    repertoire de travail du process (`[Environment]::CurrentDirectory` reste
+    fige sur le dossier de demarrage). Seule l'annonce par le shell est fiable.
+  - Dans le script, le prompt precedent est capture via `$function:prompt`
+    (ScriptBlock immuable) et **jamais** via `Get-Command prompt` : PowerShell
+    mute ce `FunctionInfo` a la redefinition, la reference « precedente »
+    devenait notre propre prompt et bouclait a l'infini.
+  L'integration est chargee par `default_prog` et non installee dans le profil
+  utilisateur : la config reste auto-portante, sans etape manuelle. `M.local_prog`
+  est le point unique qui construit l'argv local (aussi utilise par le rejeu de
+  `last_command`, cf. section Workspaces) — ne pas reconstruire cet argv ailleurs.
 - **Detection du shell mise en cache** : elle passe par
   `wezterm.run_child_process`, donc par un process enfant. Resultat memorise
   dans `wezterm.GLOBAL` pour ne tourner qu'une fois par process et non a chaque
@@ -168,8 +188,10 @@ Le module `lua/workspaces.lua` capture/restaure les workspaces dans
 - **Shell de rejeu par domaine** (`pane_spawn`) : `last_command` est relancee via
   `<shell> -NoExit -Command <cmd>`. Le shell doit exister sur la machine DU PANE :
   `powershell.exe` en dur pour un pane distant (on ne peut pas sonder vibe, et il
-  est present sur tout Windows), le shell local resolu pour un pane local. Hors
-  Windows, pas de rejeu par shell (`-NoExit -Command` est une syntaxe PowerShell) :
+  est present sur tout Windows) ; pour un pane local, `domains.local_prog(cmd)`,
+  qui ajoute l'integration OSC 7 au shell resolu — un pane restaure doit annoncer
+  son cwd comme les autres, sinon ses propres splits repartiraient du HOME. Hors
+  Windows, `local_prog` rend nil (`-NoExit -Command` est une syntaxe PowerShell) :
   on retombe sur l'argv capture.
 - **Denylist de rejeu** (`non_replayable_commands` / `is_replayable_command`) :
   certaines `last_command` ne sont jamais rejouees au restore, soit triviales

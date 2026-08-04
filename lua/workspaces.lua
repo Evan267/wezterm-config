@@ -527,22 +527,28 @@ local function pane_spawn(pane_snapshot, fallback_domain)
     spawn.cwd = cwd
   end
 
-  -- Shell utilise pour relancer `last_command` en gardant un shell interactif
-  -- (son profil PowerShell charge le workspace tracker). Il doit exister sur la
-  -- machine du pane, d'ou la distinction local/distant : on ne peut pas sonder
-  -- ce qui est installe sur vibe, et powershell.exe est present sur tout
-  -- Windows. Hors Windows, pas de rejeu par shell : `-NoExit -Command` est une
-  -- syntaxe PowerShell, on retombe sur l'argv capture.
-  local replay_shell = nil
+  -- Relance de `last_command` en gardant un shell interactif. Le shell doit
+  -- exister sur la machine du pane, d'ou la distinction local/distant :
+  --   - distant : `powershell.exe` en dur (on ne peut pas sonder ce qui est
+  --     installe sur vibe, et il est present sur tout Windows) ; son profil y
+  --     charge deja le workspace tracker ;
+  --   - local : `domains.local_prog`, qui ajoute l'integration OSC 7 au shell
+  --     resolu — un pane restaure doit annoncer son cwd comme les autres, sinon
+  --     ses propres splits repartiraient du HOME. Retourne nil hors Windows
+  --     (`-NoExit -Command` est une syntaxe PowerShell) : on retombe alors sur
+  --     l'argv capture.
+  local replay_args = nil
 
-  if domains.is_remote(domain) then
-    replay_shell = 'powershell.exe'
-  elseif domains.is_windows() then
-    replay_shell = domains.local_shell_prog()
+  if command then
+    if domains.is_remote(domain) then
+      replay_args = { 'powershell.exe', '-NoExit', '-Command', command }
+    else
+      replay_args = domains.local_prog(command)
+    end
   end
 
-  if command and replay_shell then
-    spawn.args = { replay_shell, '-NoExit', '-Command', command }
+  if replay_args then
+    spawn.args = replay_args
   elseif argv and not is_shell(argv) then
     spawn.args = argv
   end

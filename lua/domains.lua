@@ -83,6 +83,33 @@ function M.local_shell_prog()
   return wezterm.GLOBAL[SHELL_PROG_CACHE]
 end
 
+-- Script d'integration shell des panes locaux : c'est lui qui emet OSC 7, donc
+-- ce qui permet a un split ou un nouvel onglet d'heriter du repertoire courant
+-- (cf. shell/wezterm.ps1). Versionne dans le repo, a cote de la config.
+local function shell_integration_path()
+  return wezterm.config_dir .. '\\shell\\wezterm.ps1'
+end
+
+-- argv complet des panes LOCAUX : shell resolu + chargement de l'integration
+-- OSC 7, suivi d'une commande optionnelle a rejouer (restore de workspace).
+-- Retourne nil hors Windows : `-NoExit -Command` est une syntaxe PowerShell, on
+-- laisse alors WezTerm lancer le shell de login.
+function M.local_prog(command)
+  local shell = M.local_shell_prog()
+
+  if not shell or not M.is_windows() then
+    return nil
+  end
+
+  local script = ". '" .. shell_integration_path() .. "'"
+
+  if type(command) == 'string' and command ~= '' then
+    script = script .. '; ' .. command
+  end
+
+  return { shell, '-NoExit', '-Command', script }
+end
+
 -- Nom de domaine exploitable, ou nil (vide, absent, overlay).
 function M.normalize(name)
   if type(name) ~= 'string' or name == '' or overlay_domains[name] then
@@ -459,15 +486,16 @@ function M.apply(config)
   config.default_domain = M.LOCAL
 
   -- Shell des panes LOCAUX. Sous Windows, le defaut WezTerm est cmd.exe : on
-  -- lance PowerShell directement, comme sur vibe.
+  -- lance PowerShell directement, comme sur vibe, en chargeant l'integration
+  -- OSC 7 (sans elle, un split repart du HOME).
   --
   -- ATTENTION : `default_prog` ne vaut QUE pour le domaine local. Ce que le
   -- mux-server distant lance depend du `default_prog` de son propre
   -- ~/.wezterm.lua, hors de ce repo (cf. VIBE_TLS_SETUP.md).
-  local shell_prog = M.local_shell_prog()
+  local local_prog = M.local_prog()
 
-  if shell_prog then
-    config.default_prog = { shell_prog }
+  if local_prog then
+    config.default_prog = local_prog
   end
 end
 
