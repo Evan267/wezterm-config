@@ -93,8 +93,9 @@ Les chemins de la PKI sont construits dans `lua/domains.lua` à partir de
    ```powershell
    Get-Process wezterm-mux-server | Stop-Process -Force
    ```
-   Il est relancé par la **tâche planifiée** (cf. Dépannage) ; il n'y a plus de
-   redémarrage via SSH depuis le poste.
+   Il est relancé par la **tâche planifiée `\WezTermMux`** (cf. Dépannage) ;
+   il n'y a plus de redémarrage via SSH depuis le poste, mais on peut déclencher
+   la tâche à distance : `ssh 10.91.16.171 "schtasks /run /tn \WezTermMux"`.
 
 ### 2. Côté poste (client)
 
@@ -183,15 +184,38 @@ inutile de toucher au mux-server.
 - **Mismatch de hostname sur le certificat** → vérifier que
   `accept_invalid_hostnames = true` est bien présent dans le bloc `tls_clients`
   de `lua/domains.lua` (la cible étant une IP, le CN ne matche pas).
-- **Connexion TLS refusée** → vérifier dans l'ordre : le pare-feu (port 8131
-  entrant sur vibe), que le `wezterm-mux-server` tourne bien sur vibe, et que son
-  `~/.wezterm.lua` déclare bien `tls_servers` sur le bon port.
+- **Connexion TLS refusée** → diagnostiquer **depuis le poste**, dans cet ordre.
+  Le premier test sépare déjà « vibe est éteinte / hors VPN » de « le mux-server
+  ne tourne pas » :
+  ```powershell
+  Test-NetConnection 10.91.16.171 -Port 8131   # False + ping OK = mux absent
+  ssh 10.91.16.171 "tasklist | findstr /i wezterm"
+  ssh 10.91.16.171 "schtasks /query /tn \WezTermMux /fo LIST /v"
+  ```
+  Si le port répond mais que la connexion échoue quand même, vérifier le
+  pare-feu (8131 entrant sur vibe) et le `tls_servers` de son `~/.wezterm.lua`.
 - **Erreur de certificat / d'authentification** → vérifier que `~/.wezterm-tls`
   contient les bons fichiers des deux côtés (`ca.pem` commun, `client.*` sur le
   poste, `server.*` sur vibe) et qu'ils dérivent de la **même** CA.
-- **Mux indisponible après un reboot de vibe** → le mux-server ne survit pas au
-  redémarrage de la machine. La tâche planifiée `wezterm-mux-server` le relance
-  au démarrage de vibe.
+- **Mux indisponible (reboot, session RDP fermée, process tué)** → la tâche
+  planifiée s'appelle **`\WezTermMux`** (et non `wezterm-mux-server`) ; elle
+  lance `C:\Program Files\WezTerm\wezterm-mux-server.exe` **à l'ouverture de
+  session**, en `Run As User: EBerger`, mode **« Interactive only »**. La relancer
+  sans passer par RDP :
+  ```powershell
+  ssh 10.91.16.171 "schtasks /run /tn \WezTermMux"
+  ```
+  ⚠️ **Fragilité connue** : « Interactive only » attache le process à la session
+  interactive, donc il meurt avec elle. Cas observé le 17/08/2026 — la tâche
+  avait bien démarré le serveur à l'ouverture de session (08:49:49) et le process
+  était mort ensuite avec `Last Result: -1073741510`
+  (`0xC000013A` = STATUS_CONTROL_C_EXIT, terminaison par fin de console). La
+  tâche doit alors être relancée à la main, et `schtasks /run` exige qu'une
+  session interactive existe sur vibe.
+  Correctif durable possible (non appliqué) : repasser la tâche en « exécuter
+  même si l'utilisateur n'est pas connecté », par exemple
+  `schtasks /change /tn \WezTermMux /ru EBerger /np`, ce qui la détache de la
+  session RDP.
 - **Certs corrompus / à renouveler** → regénérer la PKI à la main (openssl) et
   redéposer les fichiers dans `~/.wezterm-tls` des deux côtés. WezTerm ne les
   regénère **pas** (plus de bootstrap SSH).
