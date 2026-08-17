@@ -95,17 +95,47 @@ local function save_registry(registry)
   return write_file(registry_path, wezterm.json_encode(normalize_registry(registry)))
 end
 
--- Migration des entrees anterieures a la gestion multi-domaines : elles n'ont
--- pas de champ `domain` et ont toutes ete capturees sur le mux distant (seul
--- domaine existant alors). Sans ce report, elles se restaureraient en local
--- (repli 'DefaultDomain', desormais local). Idempotente : reecrite une seule
--- fois, ensuite chaque upsert porte le domaine.
+-- Reecrit en profondeur tout `domain = 'local'` vers le mux local. Recursif : le
+-- champ existe au niveau du workspace ET de chaque pane, a n'importe quelle
+-- profondeur (tabs, arbres de splits). Rien ne doit rester sur le domaine
+-- integre, qui ne survit pas a la fermeture de la fenetre.
+local function migrate_local_to_mux(node)
+  if type(node) ~= 'table' then
+    return false
+  end
+
+  local changed = false
+
+  for key, value in pairs(node) do
+    if key == 'domain' and value == domains.LOCAL then
+      node[key] = domains.LOCAL_MUX
+      changed = true
+    elseif type(value) == 'table' and migrate_local_to_mux(value) then
+      changed = true
+    end
+  end
+
+  return changed
+end
+
+-- Deux migrations idempotentes, appliquees au chargement du registre :
+--   - entrees anterieures a la gestion multi-domaines : pas de champ `domain`,
+--     toutes capturees sur le mux distant (seul domaine existant alors). Sans ce
+--     report, elles se restaureraient en local (repli 'DefaultDomain') ;
+--   - entrees capturees sur le domaine integre `local`, qui ne persiste rien :
+--     elles passent au mux local (cf. domains.persisted, qui tient le meme role
+--     a la capture).
+-- Reecrites une seule fois, ensuite chaque upsert porte le bon domaine.
 local function migrate_domains(registry)
   local changed = false
 
   for _, workspace in ipairs(registry.workspaces) do
     if not domains.normalize(workspace.domain) then
       workspace.domain = domains.REMOTE
+      changed = true
+    end
+
+    if migrate_local_to_mux(workspace) then
       changed = true
     end
   end
@@ -765,7 +795,11 @@ local function capture_pane(item)
   local tracked_cwd = pane_user_var(p, 'WEZTERM_WORKSPACE_CWD')
   local last_command = pane_user_var(p, 'WEZTERM_WORKSPACE_LAST_COMMAND')
   local cwd = tracked_cwd or cwd_from_title(title) or current_working_dir(p)
-  local domain = domains.pane_domain(p)
+  -- `persisted` et non `pane_domain` brut : un pane capture dans le domaine
+  -- integre (session de repli, mux local indisponible au demarrage) doit
+  -- revenir dans le mux local a la restauration. Le registre ne contient donc
+  -- jamais `local`.
+  local domain = domains.persisted(domains.pane_domain(p))
 
   if argv and (argv[1]:match('^%-%-') or title == 'wslhost.exe') then
     argv = nil
@@ -792,7 +826,7 @@ end
 -- domaines (chaque pane garde le sien) ; ce champ sert de repli et d'etiquette
 -- dans les selecteurs.
 local function snapshot_domain(tabs, active_pane)
-  local from_active = active_pane and domains.pane_domain(active_pane)
+  local from_active = active_pane and domains.persisted(domains.pane_domain(active_pane))
 
   if from_active then
     return from_active
@@ -1333,8 +1367,8 @@ end
 
 function M.split_pane(window, pane, direction)
   -- `CurrentPaneDomain` explicite : un split doit rester sur la machine du pane
-  -- qu'il divise. Sur le domaine distant, la persistance reste assuree cote
-  -- mux-server (plus besoin de session tmux).
+  -- qu'il divise. La persistance est assuree cote mux-server, local comme
+  -- distant (plus besoin de session tmux).
   local ok, err = pcall(function()
     pane:split { direction = direction, domain = 'CurrentPaneDomain' }
   end)
@@ -1651,9 +1685,9 @@ function M.activate_relative(window, pane, offset)
 end
 
 -- Restaure TOUS les workspaces actifs (non archives), chacun dans sa fenetre.
--- Usage typique : apres un redemarrage du mux-server de vibe, quand les panes
--- vivants sont morts avec lui. Les workspaces deja vivants sont ignores (pas de
--- doublon), ceux sans snapshot de tabs aussi.
+-- Usage typique : apres un redemarrage d'un mux-server (vibe, ou le mux local
+-- apres un reboot), quand les panes vivants sont morts avec lui. Les workspaces
+-- deja vivants sont ignores (pas de doublon), ceux sans snapshot de tabs aussi.
 --
 -- Le decompte distingue ces deux raisons de saut : « 0/3 » tout court ne disait
 -- pas si les workspaces etaient deja ouverts ou depourvus de snapshot.

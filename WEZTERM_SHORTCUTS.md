@@ -36,27 +36,45 @@ Le **Leader Key** est le préfixe nécessaire pour les commandes système.
 
 ## 🖥️ Local ou distant
 
-WezTerm peut faire tourner les panes sur **ce PC** (domaine `local`) ou sur le
+WezTerm peut faire tourner les panes sur **ce PC** (domaine `localmux`) ou sur le
 **serveur distant** `vibe` (domaine mux TLS). Les deux cohabitent : un workspace
 local et un workspace distant peuvent etre ouverts en meme temps.
 
-* **Au demarrage** : un selecteur « Ou travailler ? » s'affiche dans la premiere
-  fenetre. `Local` garde la session sur ce PC ; `vibe` rattache le mux-server
-  distant (les workspaces deja vivants la-bas sont recuperes tels quels, sinon
-  une session distante est demarree). La premiere fenetre est **toujours** locale
-  au depart : l'ouverture de WezTerm ne depend jamais de la joignabilite du
-  serveur (VPN coupe, machine eteinte).
+Dans les deux cas les panes tournent dans un **`wezterm-mux-server`**, pas dans
+la fenetre : ils **survivent a la fermeture** (ou au crash) de WezTerm, et le
+relancer les retrouve tels quels, processus vivants et scrollback compris. En
+local, le serveur est demarre automatiquement au besoin ; il meurt en revanche
+avec la session Windows (deconnexion, reboot) — apres un reboot, la reprise
+passe par `ALT` + `SHIFT` + `r` (rejeu depuis `workspaces.json`).
+
+* **Au demarrage** : WezTerm rattache le mux local et **retrouve votre session
+  telle quelle** — une seule fenetre s'ouvre si vous n'en aviez qu'une. Le
+  selecteur « Ou travailler ? » s'affiche ensuite : `Local` confirme la session
+  de ce PC, `vibe` rattache en plus le serveur distant (ses fenetres vivantes
+  sont recuperees telles quelles, sinon une session y est demarree).
+  L'ouverture ne depend jamais de la joignabilite de `vibe` (VPN coupe, machine
+  eteinte).
+* **Si le mux local refuse de demarrer**, WezTerm ne s'ouvre pas du tout (il se
+  connecte a son domaine par defaut avant tout le reste). Porte de sortie :
+  lancer avec la variable d'environnement `WEZTERM_LOCAL_MUX=0`, qui repart sur
+  l'ancien domaine integre, sans persistance.
+* **Une seule fenetre visible a la fois par workspace** : WezTerm n'affiche que
+  les fenetres du workspace **actif**. Une fenetre d'un autre workspace n'est pas
+  fermee, juste masquee, et revient quand vous rebasculez dessus. Si vous voyez
+  deux fenetres a l'ouverture, ce sont deux fenetres du meme workspace — souvent
+  les deux `default`, celle de votre mux local et celle de vibe. Fermer celle qui
+  ne sert pas suffit.
 * **Indicateur** : la barre de statut affiche `WS <workspace> [<domaine>]`. Le
   domaine est celui du **pane actif** — c'est la machine ou tourne ce que vous
   avez sous les yeux.
 * **Raccourci `ALT` + `SHIFT` + `d`** : change le domaine par defaut de la
-  fenetre courante (local ↔ vibe). N'affecte que les spawns sans contexte ; les
+  fenetre courante (localmux ↔ vibe). N'affecte que les spawns sans contexte ; les
   workspaces enregistres gardent le domaine fige dans `workspaces.json`.
 * **Domaine memorise par workspace** : `ALT` + `n` demande le nom **puis** le
   domaine. Le domaine est enregistre dans `workspaces.json` et rejoue a la
   restauration, quel que soit le domaine de la fenetre depuis laquelle on ouvre.
   Les listes (`ALT` + `o`, `ALT` + `d`, `ALT` + `a`, `ALT` + `u`) affichent
-  `nom  [domaine]`, filtrable au clavier (taper `vibe` ou `local`).
+  `nom  [domaine]`, filtrable au clavier (taper `vibe` ou `localmux`).
 
 ---
 
@@ -66,16 +84,16 @@ Les commandes de workspace utilisent uniquement `ALT` comme modificateur. Les va
 
 | Raccourci             | Action                          | Description                                                                                                                                          |
 | :-------------------- | :------------------------------ | :--------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ALT` + `n`           | **Nouveau Workspace**           | Demande un nom puis un domaine (local / vibe), et bascule vers ce workspace non enregistre                                                            |
+| `ALT` + `n`           | **Nouveau Workspace**           | Demande un nom puis un domaine (localmux / vibe), et bascule vers ce workspace non enregistre                                                         |
 | `ALT` + `t`           | **Renommer Tab**                | Demande un nom pour le tab actif puis enregistre le workspace courant                                                                                |
 | `ALT` + `r`           | **Enregistrer Workspace**       | Enregistre ou met a jour le workspace actif                                                                                                          |
 | `ALT` + `o`           | **Ouvrir Workspace ici**        | Affiche les workspaces enregistres et ouvre la selection dans la fenetre courante                                                                    |
 | `ALT` + `SHIFT` + `o` | **Ouvrir Workspace en fenetre** | Focalise la fenetre existante si le workspace est deja ouvert; sinon restaure la selection dans une nouvelle fenetre                                 |
-| `ALT` + `SHIFT` + `r` | **Tout restaurer**              | Restaure tous les workspaces actifs, chacun dans sa fenetre (workspaces deja ouverts ignores). A utiliser apres un redemarrage du mux-server de vibe |
+| `ALT` + `SHIFT` + `r` | **Tout restaurer**              | Restaure tous les workspaces actifs, chacun dans sa fenetre (workspaces deja ouverts ignores). A utiliser apres un redemarrage d'un mux-server (vibe, ou le mux local apres un reboot) |
 | `ALT` + `d`           | **Supprimer Workspace**         | Affiche les workspaces enregistres (actifs et archives) et supprime la selection du registre                                                         |
 | `ALT` + `a`           | **Archiver Workspace**          | Liste les workspaces actifs et archive la selection : masquee de `ALT+o` et du cycle, mais conservee dans le registre                                |
 | `ALT` + `u`           | **Desarchiver Workspace**       | Liste les workspaces archives et reactive la selection (redevient visible dans `ALT+o` et le cycle)                                                  |
-| `ALT` + `SHIFT` + `d` | **Changer de domaine**          | Bascule le domaine par defaut de la fenetre courante entre `local` (ce PC) et `vibe` (serveur distant)                                               |
+| `ALT` + `SHIFT` + `d` | **Changer de domaine**          | Bascule le domaine par defaut de la fenetre courante entre `localmux` (ce PC) et `vibe` (serveur distant)                                            |
 | `ALT` + `SHIFT` + `q` | **Quitter WezTerm**             | Ferme toute l'application WezTerm, avec toutes les fenetres, tabs et panes                                                                           |
 | `ALT` + `←`           | **Workspace precedent**         | Bascule vers le workspace enregistre precedent                                                                                                       |
 | `ALT` + `→`           | **Workspace suivant**           | Bascule vers le workspace enregistre suivant                                                                                                         |
@@ -84,8 +102,8 @@ Les commandes de workspace utilisent uniquement `ALT` comme modificateur. Les va
 
 ## 🛠️ Notes de Configuration
 * **Domaine** : Les splits (`Leader` + `v`/`s`) et les nouveaux tabs (`Leader` + `t`) utilisent `CurrentPaneDomain` : ils restent sur la machine du pane courant, pas sur le domaine par defaut de la fenetre. Un tab ouvert dans un workspace distant reste donc distant, meme si la fenetre est locale par defaut.
-* **Shell** : Sous Windows, les panes **locaux** ouvrent PowerShell directement (`pwsh.exe` s'il est installe, sinon `powershell.exe`) et non `cmd.exe`, qui est le defaut WezTerm. Forcable via la cle `SHELL_PROG` du `.env`. Les panes du domaine `vibe` dependent du `default_prog` configure sur le serveur, pas d'ici.
-* **Domaine d'un workspace** : Stocke dans `workspaces.json` (champ `domain`, par workspace et par pane). Il est capture a l'enregistrement et rejoue a la restauration. Les entrees creees avant la gestion multi-domaines sont migrees automatiquement vers `vibe` au premier chargement (elles ne pouvaient venir que de la).
+* **Shell** : Sous Windows, les panes **locaux** ouvrent PowerShell directement (`pwsh.exe` s'il est installe, sinon `powershell.exe`) et non `cmd.exe`, qui est le defaut WezTerm. Forcable via la cle `SHELL_PROG` du `.env`. Le mux local lisant la meme config, il applique le meme shell ; en revanche il le fige a son demarrage, donc changer `SHELL_PROG` suppose de le redemarrer (`Stop-Process -Name wezterm-mux-server`, les panes vivants sont alors perdus). Les panes du domaine `vibe` dependent du `default_prog` configure sur le serveur, pas d'ici.
+* **Domaine d'un workspace** : Stocke dans `workspaces.json` (champ `domain`, par workspace et par pane). Il est capture a l'enregistrement et rejoue a la restauration. Deux migrations automatiques au chargement : les entrees creees avant la gestion multi-domaines passent a `vibe` (elles ne pouvaient venir que de la), et celles enregistrees sur l'ancien domaine local non persistant passent a `localmux`. Un workspace de ce PC est donc **toujours** restaure dans le mux local.
 * **Domaine injoignable** : Si `vibe` est inaccessible (VPN coupe, serveur eteint), ouvrir un workspace distant affiche `Domaine vibe injoignable` et ne casse rien ; `ALT` + `SHIFT` + `r` restaure quand meme tous les workspaces **locaux** et compte les autres dans `domaine injoignable`.
 * **Registre** : Les workspaces sauvegardes sont stockes dans `workspaces.json` a la racine de cette configuration.
 * **Sortie** : `exit_behavior = 'Close'` ferme les panes des que leur process se termine, meme si le dernier code de sortie n'est pas zero.
@@ -93,7 +111,7 @@ Les commandes de workspace utilisent uniquement `ALT` comme modificateur. Les va
 * **Titres de tabs** : Les titres definis avec `ALT` + `t` sont stockes dans `workspaces.json` et reappliques lors de la restauration.
 * **Restauration workspace** : Si le workspace est deja ouvert, la config le rejoint sans relancer les commandes. Sinon, elle recree les tabs/panes, retourne dans les repertoires sauvegardes et relance la derniere commande quand elle est disponible. Certaines commandes ne sont jamais rejouees (triviales ou dangereuses : `cd`, `clear`, `ls`, `exit`, `wezterm-mux-server`, …).
 * **Auto-sauvegarde** : Toutes les 60 s, les workspaces **deja enregistres** sont rafraichis depuis leurs fenetres vivantes (cwd et commandes recents), sans en creer de nouveaux ni ecraser une sauvegarde par un etat vide. Objectif : que `ALT` + `Shift` + `r` reparte d'un etat recent apres un redemarrage du mux-server.
-* **Perte au redemarrage du mux-server** : Les panes tournent comme process enfants du `wezterm-mux-server` de vibe ; s'il redemarre, ils meurent avec lui (le mux-server ne persiste pas sur disque). `ALT` + `Shift` + `r` relance alors tous les workspaces actifs depuis `workspaces.json`.
+* **Perte au redemarrage du mux-server** : Les panes tournent comme process enfants d'un `wezterm-mux-server` — celui de vibe, ou le mux local, qui meurt avec la session Windows (deconnexion, reboot). S'il redemarre, ils meurent avec lui (le mux-server ne persiste pas sur disque). `ALT` + `Shift` + `r` relance alors tous les workspaces actifs depuis `workspaces.json`.
 * **Suppression workspace** : La suppression retire uniquement l'entree du registre; elle ne ferme pas un workspace deja ouvert.
 * **Archivage workspace** : L'archivage (`ALT` + `a`) retire le workspace des listes du quotidien (`ALT` + `o` et cycle `ALT` + `←`/`→`) sans rien supprimer : tabs, panes et cwd restent intacts dans `workspaces.json` (marqueur `archived_at`). `ALT` + `u` le reactive. L'operation est reversible autant de fois que voulu et n'affecte pas une session deja ouverte. Un workspace archive reste supprimable via `ALT` + `d` (marque « (archive) » dans la liste).
 * **Suivi shell** : Le fichier `shell/bash-workspace-tracker.bash` publie le repertoire courant et la derniere commande a WezTerm via des user vars.
