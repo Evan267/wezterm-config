@@ -852,7 +852,14 @@ local function capture_pane(item)
   local title = pane_title(p)
   local tracked_cwd = pane_user_var(p, 'WEZTERM_WORKSPACE_CWD')
   local last_command = pane_user_var(p, 'WEZTERM_WORKSPACE_LAST_COMMAND')
-  local cwd = tracked_cwd or cwd_from_title(title) or current_working_dir(p)
+  -- ORDRE DE CONFIANCE : ce que le shell ANNONCE (user var du tracker), puis
+  -- l'OSC 7 relu par WezTerm, et le TITRE seulement en dernier recours. Le
+  -- titre etait teste en 2e position et produisait de faux repertoires : le
+  -- 2026-08-19, l'onglet 2 de `chaud-devant` a ete enregistre avec
+  -- `C:/Program Files/PowerShell/7/pwsh.exe` comme repertoire, extrait du titre
+  -- « Administrator: ... pwsh.exe ». Un pane restaure repartait donc d'un
+  -- EXECUTABLE. Ne pas remonter le titre dans cet ordre.
+  local cwd = tracked_cwd or current_working_dir(p) or cwd_from_title(title)
   -- `persisted` et non `pane_domain` brut : un pane capture dans le domaine
   -- integre (session de repli, mux local indisponible au demarrage) doit
   -- revenir dans le mux local a la restauration. Le registre ne contient donc
