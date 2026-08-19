@@ -29,6 +29,11 @@ local snapshot_version = 1
 -- n'est pas un workspace de travail, et c'est la qu'on relegue les fenetres qui
 -- n'ont rien a faire ailleurs (cf. evict_foreign_windows).
 local scratch_workspace = 'default'
+-- Workspace de PARKING : n'est jamais l'actif, donc son contenu n'est jamais
+-- affiche. On y jette les fenetres d'amorcage des mux-servers des leur import.
+-- Le deplacement est INSTANTANE, la ou fermer suppose un aller-retour avec le
+-- shell — c'est ce delai qui les laissait visibles au lancement.
+local parking_workspace = 'wezterm-amorcage'
 
 local notify = notifications.info
 local notify_error = notifications.error
@@ -465,6 +470,19 @@ local function cwd_from_title(title)
   end
 
   return nil
+end
+
+-- Repertoire courant d'un pane VIVANT, dans le meme ordre de confiance que
+-- `capture_pane` : ce que le shell annonce d'abord, le titre ensuite, l'OSC 7
+-- relu par WezTerm en dernier.
+--
+-- Cette fonction manquait alors que deux appelants l'utilisaient : l'erreur
+-- « attempt to call a nil value » etait avalee par un pcall, et toute
+-- l'expulsion des fenetres intruses ne faisait rien, en silence (2026-08-19).
+local function pane_cwd(pane, title)
+  return pane_user_var(pane, 'WEZTERM_WORKSPACE_CWD')
+    or cwd_from_title(title)
+    or current_working_dir(pane)
 end
 
 local function find_workspace(registry, name)
@@ -1183,8 +1201,16 @@ local function evict_foreign_windows()
         local bootstrap = is_bootstrap_window(mux_window)
 
         if bootstrap then
-          append_debug('fenetre d amorcage fermee dans ' .. tostring(host_workspace)
+          append_debug('fenetre d amorcage ecartee de ' .. tostring(host_workspace)
             .. ' (domaine ' .. tostring(actual) .. ')')
+
+          -- D'ABORD hors du champ : instantane, et sans dependre du shell.
+          pcall(function()
+            mux_window:set_workspace(parking_workspace)
+          end)
+
+          -- ENSUITE on la libere pour de bon. Si le shell ne repond pas, elle
+          -- reste garee la ou personne ne la voit : le pire cas est propre.
           pcall(function()
             bootstrap:send_text('exit' .. string.char(13))
           end)
@@ -1197,21 +1223,27 @@ local function evict_foreign_windows()
 
       if expected and actual and expected ~= actual then
         local bootstrap = is_bootstrap_window(mux_window)
-        local moved = pcall(function()
-          mux_window:set_workspace(scratch_workspace)
-        end)
 
-        append_debug('fenetre intruse ecartee de ' .. tostring(host_workspace)
-          .. ' (domaine ' .. tostring(actual) .. ' au lieu de ' .. tostring(expected)
-          .. ') ok=' .. tostring(moved)
-          .. ' amorcage=' .. tostring(bootstrap ~= nil))
+        -- ON NE DEPLACE QUE LES FENETRES D'AMORCAGE. Le domaine qui ne colle pas
+        -- suffit a dire « cette fenetre n'a rien a faire ici », pas a dire ou
+        -- elle devrait etre. Le 2026-08-19, une VRAIE session (chaud-devant, 3
+        -- panes) s'etait retrouvee etiquetee `modif-order` : la deplacer l'a
+        -- sortie du champ au lieu de la rendre a son workspace. Une session
+        -- vivante ne se deplace pas sur un simple soupcon — on la signale.
+        if not bootstrap then
+          append_debug('fenetre etrangere signalee dans ' .. tostring(host_workspace)
+            .. ' (domaine ' .. tostring(actual) .. ' au lieu de ' .. tostring(expected)
+            .. ') : laissee en place, ce n est pas une fenetre d amorcage')
+        else
+          local moved = pcall(function()
+            mux_window:set_workspace(parking_workspace)
+          end)
 
-        -- Fenetre d'amorcage : on la fait sortir pour de bon plutot que de la
-        -- laisser s'accumuler dans le workspace de passage.
-        if bootstrap then
+          append_debug('fenetre d amorcage ecartee de ' .. tostring(host_workspace)
+            .. ' (domaine ' .. tostring(actual) .. ' au lieu de ' .. tostring(expected)
+            .. ') ok=' .. tostring(moved))
+
           pcall(function()
-            -- `string.char(13)` plutot qu'un retour chariot echappe : les
-            -- echappements ne survivent pas a tous les outils d'edition.
             bootstrap:send_text('exit' .. string.char(13))
           end)
         end
@@ -1221,13 +1253,68 @@ local function evict_foreign_windows()
 end
 
 -- L'import des fenetres distantes est asynchrone : on repasse peu apres.
-local function evict_foreign_windows_soon()
-  pcall(evict_foreign_windows)
+-- SURVEILLANCE BORNEE plutot que quelques passes minutees. L'import des fenetres
+-- d'un domaine est asynchrone, et son delai n'est pas previsible : rattacher un
+-- mux deja demarre est immediat, mais en DEMARRER un prend plusieurs secondes.
+-- Mesure le 2026-08-19 : des passes s'arretant a 2,5 s rataient l'import qui
+-- suivait le demarrage du mux local, et la fenetre d'amorcage restait — dans
+-- `modif-order`, le workspace actif a cet instant, qui s'est retrouve a deux
+-- fenetres.
+--
+-- On ouvre donc une fenetre de surveillance apres chaque rattachement, balayee a
+-- chaque `update-status` (soit environ une fois par seconde). Le balayage ne
+-- coute qu'un parcours des fenetres mux ; hors surveillance il ne coute qu'une
+-- comparaison d'horodatage.
+-- La surveillance bat sur des TIMERS, pas sur `update-status`. L'evenement ne
+-- tire pas de facon fiable quand la fenetre n'a pas le focus — et c'est
+-- precisement le cas au demarrage, ou l'utilisateur regarde ailleurs pendant que
+-- les domaines se rattachent. Une fenetre d'amorcage importee restait alors en
+-- place faute de battement (constate le 2026-08-19 : surveillance armee a
+-- 22:22:38, fenetre toujours dans `default` deux minutes plus tard).
+local eviction_watch_flag = 'workspace_eviction_watch_until'
+local eviction_watch_seconds = 25
+local eviction_watch_interval = 0.5
+
+local function watch_tick()
+  local until_when = wezterm.GLOBAL[eviction_watch_flag]
+
+  if type(until_when) ~= 'number' or os.time() >= until_when then
+    return
+  end
+
+  -- L'erreur est JOURNALISEE. Un pcall muet ici a masque pendant des heures un
+  -- appel a une fonction inexistante : l'expulsion ne faisait rien et rien ne le
+  -- disait.
+  local ok, err = pcall(evict_foreign_windows)
+
+  if not ok then
+    append_debug('expulsion erreur: ' .. tostring(err))
+  end
 
   if wezterm.time and wezterm.time.call_after then
-    wezterm.time.call_after(1.5, function()
-      pcall(evict_foreign_windows)
-    end)
+    wezterm.time.call_after(eviction_watch_interval, watch_tick)
+  end
+end
+
+local function watch_for_foreign_windows()
+  local already_watching = false
+  local until_when = wezterm.GLOBAL[eviction_watch_flag]
+
+  if type(until_when) == 'number' and os.time() < until_when then
+    already_watching = true
+  end
+
+  wezterm.GLOBAL[eviction_watch_flag] = os.time() + eviction_watch_seconds
+
+  local ok, err = pcall(evict_foreign_windows)
+
+  if not ok then
+    append_debug('expulsion erreur: ' .. tostring(err))
+  end
+
+  -- Une seule chaine de timers a la fois : prolonger l'echeance suffit.
+  if not already_watching and wezterm.time and wezterm.time.call_after then
+    wezterm.time.call_after(eviction_watch_interval, watch_tick)
   end
 end
 
@@ -1258,7 +1345,7 @@ local function preload_domains()
         .. ' ok=' .. tostring(ok) .. ' (' .. tostring(reason) .. ')')
 
       if ok then
-        evict_foreign_windows_soon()
+        watch_for_foreign_windows()
       end
     end
   end
@@ -1549,7 +1636,7 @@ local function restore_workspace(window, pane, workspace)
 
   -- Le rattachement vient peut-etre d'importer la fenetre d'amorcage du serveur
   -- dans le workspace courant : on l'ecarte avant de continuer.
-  evict_foreign_windows_soon()
+  watch_for_foreign_windows()
 
   -- PAS de mode « nouvelle fenetre ». Invariant du depot : une seule fenetre
   -- ouverte a la fois. Un workspace s'ouvre la ou on est — WezTerm y revele la
