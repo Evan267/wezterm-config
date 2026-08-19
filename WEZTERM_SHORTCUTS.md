@@ -20,6 +20,7 @@ Le **Leader Key** est le préfixe nécessaire pour les commandes système.
 | `Leader` + `v` | **Split Horizontal**    | Divise le panneau horizontalement                                                  |
 | `Leader` + `s` | **Split Vertical**      | Divise le panneau verticalement                                                    |
 | `Leader` + `w` | **Fermer Panneau**      | Ferme le panneau actif (demande confirmation)                                      |
+| `Leader` + `W` | **Fermer Onglet**       | Ferme l'onglet actif et tous ses panneaux (demande confirmation)                   |
 | `Leader` + `m` | **Debloquer la souris** | Reinitialise le suivi souris/focus reste bloque (souris = frappe clavier parasite) |
 
 ---
@@ -62,6 +63,13 @@ passe par `ALT` + `SHIFT` + `r` (rejeu depuis `workspaces.json`).
   domaine est ensuite fige dans `workspaces.json` : rouvrir le workspace le
   ramene toujours au meme endroit, sans rien demander. `ALT` + `SHIFT` + `d`
   change le domaine par defaut de la fenetre courante.
+* **La disposition s'enregistre a chaque changement**, et non plus toutes les
+  60 s : un split, un nouvel onglet, un renommage (`ALT` + `t`), une fermeture de
+  panneau ou d'onglet, un redimensionnement, l'ouverture d'un workspace. Rien
+  d'autre n'ecrit. Un redimensionnement n'est capture qu'une fois le geste
+  TERMINE : maintenir `META` + `h`/`l` ou trainer le bord d'une fenetre emet des
+  dizaines d'evenements, il n'en resulte qu'une seule ecriture. Un `cd` seul, en
+  revanche, n'est pas enregistre sur le moment ; il le sera a la prochaine action.
 * **Une seule fenetre visible a la fois par workspace** : WezTerm n'affiche que
   les fenetres du workspace **actif**. Une fenetre d'un autre workspace n'est pas
   fermee, juste masquee, et revient quand vous rebasculez dessus. Si vous voyez

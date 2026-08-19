@@ -51,6 +51,10 @@ local function split_nav(resize_or_move, key)
       else
 	if resize_or_move == 'resize' then
 	  win:perform_action({ AdjustPaneSize = { direction_keys[key], 3 } }, pane)
+	  -- Maintenir la touche emet une rafale : l'anti-rebond de fin de
+	  -- lua/workspaces.lua n'en fera qu'une seule capture, une fois le geste
+	  -- termine.
+	  workspaces.note_resize(win)
 	else
 	  win:perform_action({ ActivatePaneDirection = direction_keys[key] }, pane)
 	end
@@ -85,7 +89,30 @@ function M.apply(config)
 	workspaces.split_pane(window, pane, 'Bottom')
       end),
     },
-    { key = 'w', mods = 'LEADER', action = w.action.CloseCurrentPane { confirm = true } },
+    -- Fermeture d'un pane et d'un onglet : enveloppees dans un callback, car
+    -- WezTerm n'expose AUCUN evenement de fermeture (ni `pane-exited`, ni
+    -- `tab-closed` — verifie dans le binaire). Sans cet enrobage, la
+    -- disposition ne serait enregistree qu'a la prochaine action.
+    --
+    -- Le delai laisse passer la confirmation : on capture APRES la reponse,
+    -- pas pendant la question. Si l'utilisateur annule, la capture enregistre
+    -- l'etat inchange, ce qui est sans consequence.
+    {
+      key = 'w',
+      mods = 'LEADER',
+      action = w.action_callback(function(window, pane)
+	window:perform_action(w.action.CloseCurrentPane { confirm = true }, pane)
+	workspaces.note_change(window, 6)
+      end),
+    },
+    {
+      key = 'W',
+      mods = 'LEADER',
+      action = w.action_callback(function(window, pane)
+	window:perform_action(w.action.CloseCurrentTab { confirm = true }, pane)
+	workspaces.note_change(window, 6)
+      end),
+    },
     {
       -- Deblocage du suivi souris reste actif apres la mort d'une appli TUI.
       -- Fait ecrire les DECRST par le shell (cf. RESET_MOUSE_CMD) : fiable sur les

@@ -225,6 +225,25 @@ Points de maintenance :
   `+ 0.005` compense le `floor` applique cote Rust
   (`SplitSize::Percent((size * 100.).floor())`), qui faisait perdre un point de
   pourcentage a chaque restauration sur certaines valeurs.
+- **Sauvegarde a l'EVENEMENT, avec anti-rebond de FIN** (`save_soon`). On
+  n'enregistre que le workspace qui vient de bouger, et seulement sur une action
+  dont on maitrise la frequence : split, nouvel onglet, renommage, fermeture d'un
+  pane ou d'un onglet, redimensionnement, ouverture d'un workspace.
+  - **L'anti-rebond doit etre de FIN, pas de debut** : chaque demande annule la
+    precedente (jeton par workspace), la capture part N secondes apres la
+    DERNIERE. C'est ce qui permet de brancher un redimensionnement — maintenir
+    une touche ou trainer le bord d'une fenetre emet des dizaines d'evenements
+    pour une seule ecriture. Verifie le 2026-08-19 : treize bascules de workspace
+    en trois secondes, deux captures au total.
+  - **Ne PAS brancher `user-var-changed`.** Le shell annonce son repertoire a
+    chaque invite, mais la cadence est imprevisible : une TUI qui redessine et
+    l'evenement part en rafale. Essaye le meme soir, WezTerm s'est fige — chaque
+    rafale relancait une capture, donc un aller-retour reseau par pane distant
+    sur le thread GUI. Meme cause que le balayage des fenetres intruses.
+  - **Fermetures : pas d'evenement.** Ni `pane-exited` ni `tab-closed` n'existent
+    (verifie dans le binaire ; `window-resized` et `window-focus-changed`, si).
+    Les raccourcis de fermeture sont donc enveloppes dans un `action_callback`
+    qui signale le changement, avec un delai laissant passer la confirmation.
 - **Etat runtime HORS de `config_dir`** : le registre et le journal sont ecrits
   dans `~/.wezterm-workspaces.json` et `~/.wezterm-workspaces.log`, **jamais**
   dans `wezterm.config_dir`. WezTerm surveille son repertoire de config et

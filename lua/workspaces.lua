@@ -1078,12 +1078,22 @@ local auto_save_heartbeat_flag = 'workspace_auto_save_heartbeat'
 -- Debounce : une action en declenche souvent plusieurs (un split emet aussi un
 -- changement de cwd). On coalesce, et on laisse le temps au nouveau pane
 -- d'exister avant de le capturer.
+-- Deux cadences : les actions discretes (un split, un onglet) sont capturees
+-- vite ; un redimensionnement, lui, arrive en rafale et doit d'abord se calmer.
 local save_debounce = 2
-local pending_saves = {}
+local resize_debounce = 5
+
+-- ANTI-REBOND DE FIN. Chaque demande annule la precedente : la capture part N
+-- secondes apres la DERNIERE, pas apres la premiere. C'est ce qui permet de
+-- brancher un redimensionnement — maintenir une touche ou trainer le bord d'une
+-- fenetre emet des dizaines d'evenements, et il n'en resultera qu'une seule
+-- capture, une fois le geste fini.
+--
+-- Le jeton est un simple compteur par workspace : la fonction differee ne fait
+-- rien si un jeton plus recent a ete emis entre-temps.
+local save_tokens = {}
 
 local function capture_workspace_now(name)
-  pending_saves[name] = nil
-
   if not is_saveable_workspace(name) then
     return
   end
@@ -1101,10 +1111,10 @@ local function capture_workspace_now(name)
 end
 
 -- Point d'entree unique : « ce workspace a bouge, enregistre-le bientot ».
-local function save_soon(name)
+local function save_soon(name, delay)
   name = canonical_workspace_name(name)
 
-  if not is_saveable_workspace(name) or pending_saves[name] then
+  if not is_saveable_workspace(name) then
     return
   end
 
@@ -1112,28 +1122,52 @@ local function save_soon(name)
     return
   end
 
-  pending_saves[name] = true
+  local token = (save_tokens[name] or 0) + 1
+  save_tokens[name] = token
 
-  wezterm.time.call_after(save_debounce, function()
+  wezterm.time.call_after(delay or save_debounce, function()
+    -- Une demande plus recente est arrivee : celle-ci n'a plus lieu d'etre.
+    if save_tokens[name] ~= token then
+      return
+    end
+
+    save_tokens[name] = nil
+
     local ok, err = pcall(capture_workspace_now, name)
 
     if not ok then
-      pending_saves[name] = nil
       append_debug('sauvegarde erreur name=' .. tostring(name) .. ': ' .. tostring(err))
     end
   end)
 end
 
--- Enregistre le workspace de la fenetre courante.
-local function save_window_soon(window)
+-- Enregistre le workspace de la fenetre courante. Exportee : les raccourcis de
+-- lua/keys.lua s'en servent pour signaler ce que WezTerm n'expose pas en
+-- evenement (fermeture d'un pane ou d'un onglet, redimensionnement au clavier).
+local function save_window_soon(window, delay)
   local ok, name = pcall(function()
     return window:active_workspace()
   end)
 
   if ok and name then
-    save_soon(name)
+    save_soon(name, delay)
   end
 end
+
+function M.note_change(window, delay)
+  save_window_soon(window, delay)
+end
+
+function M.note_resize(window)
+  save_window_soon(window, resize_debounce)
+end
+
+-- Le redimensionnement de la FENETRE change la taille de tous ses panes. Seul
+-- evenement de geometrie expose par WezTerm (pas de `pane-resized`), et il part
+-- en rafale pendant un glisser : l'anti-rebond de fin s'en charge.
+wezterm.on('window-resized', function(window)
+  save_window_soon(window, resize_debounce)
+end)
 -- ---------------------------------------------------------------------------
 -- Prechargement des connexions, une fois par process
 --
