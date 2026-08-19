@@ -549,7 +549,38 @@ local function set_workspace_archived(name, archived)
   return save_registry(registry)
 end
 
+-- REFUS D'ECRASER UN ENREGISTREMENT PAR LE CONTENU D'UN AUTRE WORKSPACE.
+--
+-- WezTerm peut etiqueter une fenetre avec un workspace qui n'est pas le sien
+-- (import au rattachement d'un domaine, spawn place dans le workspace actif).
+-- La capture, elle, fait confiance a cette etiquette : elle a donc enregistre
+-- deux fois la session `chaud-devant` (localmux) a la place de celle de
+-- `modif-order` (vibe), detruisant un enregistrement juste.
+--
+-- Le domaine est le temoin le plus sur : un workspace enregistre sur `vibe` ne
+-- peut pas se mettre a vivre sur `localmux` du jour au lendemain. En cas de
+-- desaccord, on garde l'ancien enregistrement et on le dit. Perdre une mise a
+-- jour est reparable ; perdre la disposition d'un workspace ne l'est pas.
+local function contradicts_saved_domain(name, snapshot)
+  local existing = find_workspace(load_registry(), name)
+
+  if not existing then
+    return false
+  end
+
+  local was = domains.normalize(existing.domain)
+  local now = domains.normalize(snapshot.domain)
+
+  return was ~= nil and now ~= nil and was ~= now
+end
+
 local function upsert_workspace(name, snapshot)
+  if contradicts_saved_domain(name, snapshot) then
+    append_debug('capture REFUSEE name=' .. tostring(name)
+      .. ' : domaine ' .. tostring(snapshot.domain)
+      .. ' contredit l enregistrement, disposition conservee')
+    return false
+  end
   append_debug('upsert start name=' .. tostring(name))
   local registry = load_registry()
   local existing = find_workspace(registry, name)
