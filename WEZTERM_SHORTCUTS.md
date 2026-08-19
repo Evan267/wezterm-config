@@ -47,17 +47,16 @@ local, le serveur est demarre automatiquement au besoin ; il meurt en revanche
 avec la session Windows (deconnexion, reboot) — apres un reboot, la reprise
 passe par `ALT` + `SHIFT` + `r` (rejeu depuis `workspaces.json`).
 
-* **Au demarrage** : WezTerm rattache le mux local et **retrouve votre session
-  telle quelle** — une seule fenetre s'ouvre si vous n'en aviez qu'une. Le
-  selecteur « Ou travailler ? » s'affiche ensuite : `Local` confirme la session
-  de ce PC, `vibe` rattache en plus le serveur distant (ses fenetres vivantes
-  sont recuperees telles quelles, sinon une session y est demarree).
-  L'ouverture ne depend jamais de la joignabilite de `vibe` (VPN coupe, machine
-  eteinte).
-* **Si le mux local refuse de demarrer**, WezTerm ne s'ouvre pas du tout (il se
-  connecte a son domaine par defaut avant tout le reste). Porte de sortie :
-  lancer avec la variable d'environnement `WEZTERM_LOCAL_MUX=0`, qui repart sur
-  l'ancien domaine integre, sans persistance.
+* **Au demarrage** : WezTerm s'ouvre sur le domaine **local integre**, sans
+  solliciter le moindre serveur mux. Aucune question n'est posee, et l'ouverture
+  ne peut donc pas echouer parce qu'un serveur ne repond pas. Les panes de ce
+  premier workspace (`default`) vivent dans la fenetre et meurent avec elle.
+* **Le serveur se choisit a la CREATION d'un workspace** (`ALT` + `n`) : `Local`
+  le fait vivre dans le `wezterm-mux-server` de ce PC, `vibe` sur le serveur
+  distant. Dans les deux cas ses panes survivent a la fermeture de WezTerm. Le
+  domaine est ensuite fige dans `workspaces.json` : rouvrir le workspace le
+  ramene toujours au meme endroit, sans rien demander. `ALT` + `SHIFT` + `d`
+  change le domaine par defaut de la fenetre courante.
 * **Une seule fenetre visible a la fois par workspace** : WezTerm n'affiche que
   les fenetres du workspace **actif**. Une fenetre d'un autre workspace n'est pas
   fermee, juste masquee, et revient quand vous rebasculez dessus. Si vous voyez

@@ -24,26 +24,35 @@ Les conventions de code, de maintenance et de structure sont décrites dans
 ## Spécificités multi-machines
 
 Ce repo est la config **du client** (le poste local). Il peut faire tourner les
-panes sur ce PC, dans un `wezterm-mux-server` local (domaine unix `localmux`,
-démarré à la demande) **ou** sur le `wezterm-mux-server` de `vibe` (`WS871674`),
-en TLS direct ; ce serveur distant tourne avec sa propre config `~/.wezterm.lua`
-(hors de ce repo, bloc `tls_servers`). Le choix se fait au démarrage (sélecteur
-« Où travailler ? »), par workspace (champ `domain` dans `workspaces.json`) et
-par fenêtre (`ALT+SHIFT+D`). Le domaine par défaut est `localmux` : les panes
-locaux survivent ainsi à la fermeture du GUI, comme ceux de vibe.
+panes dans le process GUI (domaine **intégré** `local`), dans un
+`wezterm-mux-server` local (domaine unix `localmux`, démarré à la demande) **ou**
+sur le `wezterm-mux-server` de `vibe` (`WS871674`), en TLS direct ; ce serveur
+distant tourne avec sa propre config `~/.wezterm.lua` (hors de ce repo, bloc
+`tls_servers`).
 
-Le domaine **intégré** `local` (panes dans le process GUI, donc non persistants)
-n'est plus proposé mais reste le repli ultime de `ensure_session_window`.
-Ne pas le supprimer. Attention : WezTerm se **termine** au lancement si son
-`default_domain` est injoignable — donc si le mux local ne démarre pas. La seule
-porte de sortie est `WEZTERM_LOCAL_MUX=0` dans l'environnement ; ce compromis est
-assumé pour le mux local (même machine) et resterait inacceptable pour `vibe`. En revanche `workspaces.json` ne doit **jamais** le contenir : la
-capture (`domains.persisted`) et la migration au chargement
-(`migrate_local_to_mux`) réécrivent `local` en `localmux`, pour qu'un workspace
-de ce PC se restaure toujours dans le mux.
+**Au lancement, WezTerm est sur le domaine intégré `local` et ne sollicite aucun
+mux-server** : pas de socket à joindre, pas de serveur à démarrer, pas de session
+à refléter. C'est ce qui rend le démarrage insensible à l'état des serveurs —
+WezTerm se **termine** au lancement si son `default_domain` est injoignable, et
+c'était le risque permanent de `default_domain = localmux`. Contrepartie assumée :
+les panes du workspace de passage `default` meurent avec la fenêtre.
+
+**Le choix d'un serveur est une question de création de workspace, pas de
+lancement du terminal.** Il n'y a plus de sélecteur au démarrage : `ALT+n`
+demande le domaine du nouveau workspace (mux local ou `vibe` — jamais l'intégré,
+un workspace nommé doit survivre à la fermeture), et ce domaine est ensuite figé
+dans `workspaces.json` (champ `domain`, par workspace et par pane). `ALT+SHIFT+D`
+reste la bascule par fenêtre. `unix_domains` n'a pas `connect_automatically` : le
+mux local ne démarre qu'au premier spawn qui le vise.
+
+Ne pas supprimer le domaine intégré `local` : c'est celui du démarrage. En
+revanche `workspaces.json` ne doit **jamais** le contenir : la capture
+(`domains.persisted`) et la migration au chargement (`migrate_local_to_mux`)
+réécrivent `local` en `localmux`, pour qu'un workspace de ce PC se restaure
+toujours dans un mux.
 
 Tout est déclaré dans `lua/domains.lua` (`unix_domains`, `tls_clients`,
-`default_domain`, `gui-startup`) — plus dans `lua/options.lua`. Attention :
+`default_domain`) — plus dans `lua/options.lua`. Attention :
 le mux local tourne sur cette machine et lit **ce même fichier de config**, donc
 il hérite de `default_prog` mais fige la config à son démarrage. Tout changement
 du domaine mux distant (port, IP, certificats dans `~/.wezterm-tls`) doit rester

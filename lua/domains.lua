@@ -24,21 +24,6 @@ local overlay_domains = {
   TermWizTerminalDomain = true,
 }
 
--- Drapeau one-shot du selecteur de demarrage. Dans wezterm.GLOBAL pour survivre
--- a un reload de config (qui reconstruit l'etat Lua) : le selecteur ne doit
--- s'afficher qu'au tout premier lancement du process, pas a chaque reload.
-local STARTUP_PROMPT_FLAG = 'domain_startup_prompt_pending'
-
--- Delais de la sequence de demarrage (secondes). Le rattachement d'un domaine
--- mux est asynchrone : ni les fenetres reflechies par le serveur au demarrage,
--- ni celles d'une session distante n'apparaissent immediatement. Les deux
--- boucles d'attente sont bornees, et le cas « rien n'est venu » est traite.
-local startup_window_retry = 0.1
-local startup_window_attempts = 15
-local attach_retry = 0.1
-local attach_attempts = 15
-local attach_attempts_remote = 50
-
 -- Shell des panes locaux, par ordre de preference sous Windows. pwsh.exe
 -- (PowerShell 7+) d'abord, powershell.exe (5.1, toujours present) en repli.
 local windows_shells = { 'pwsh.exe', 'powershell.exe' }
@@ -139,18 +124,6 @@ end
 function M.is_remote(name)
   name = M.normalize(name)
   return name ~= nil and not M.is_local(name)
-end
-
--- Porte de sortie : `WEZTERM_LOCAL_MUX=0` dans l'environnement fait demarrer
--- WezTerm sur le domaine integre. Indispensable parce que le domaine par defaut
--- est rattache AVANT tout : s'il est injoignable, WezTerm ne s'ouvre pas du tout
--- (« failed to connect to Socket(...); terminating » dans
--- ~/.local/share/wezterm/wezterm-gui.exe-log-*.txt). Un `--config
--- default_domain=...` en ligne de commande ne sert a rien, `M.apply` le reecrit.
-function M.local_mux_enabled()
-  local value = os.getenv('WEZTERM_LOCAL_MUX')
-
-  return value ~= '0' and value ~= 'false'
 end
 
 -- Domaine tel qu'il doit etre ENREGISTRE dans workspaces.json. Le domaine
@@ -273,9 +246,10 @@ function M.set_window_default(window, name)
   end)
 end
 
--- Le domaine integre `local` n'est PAS propose : tout ce qui tourne sur ce PC
--- passe par le mux local, sinon rien ne survit a la fermeture de la fenetre.
--- Il reste joignable comme repli automatique (cf. gui-startup).
+-- Choix proposes a la CREATION d'un workspace (et a ALT+SHIFT+D). Le domaine
+-- integre `local` n'y figure pas volontairement : c'est celui du demarrage et du
+-- workspace de passage, ou les panes meurent avec la fenetre. Un workspace
+-- nomme, lui, doit survivre — donc mux local ou vibe, jamais l'integre.
 local function domain_choices()
   return {
     { id = M.LOCAL_MUX, label = 'Local - ce PC (panes persistants)' },
@@ -317,227 +291,15 @@ function M.prompt_switch_default(window, pane)
   end)
 end
 
-local function focus_mux_window(mux_window)
-  pcall(function()
-    local gui_window = mux_window:gui_window()
-    gui_window:restore()
-    gui_window:focus()
-  end)
-end
-
-local function mux_window_id(window)
-  local ok, id = pcall(function()
-    return window:mux_window():window_id()
-  end)
-
-  if ok then
-    return id
-  end
-
-  return nil
-end
-
--- Fenetres mux dont le pane actif tourne sur `domain_name`, hors fenetre
--- courante. Sert a detecter ce que domain:attach() a reellement rattache.
-local function windows_on_domain(domain_name, exclude_id)
-  local result = {}
-
-  if not wezterm.mux or not wezterm.mux.all_windows then
-    return result
-  end
-
-  for _, mux_window in ipairs(wezterm.mux.all_windows()) do
-    local id_ok, id = pcall(function()
-      return mux_window:window_id()
-    end)
-
-    if not id_ok or id ~= exclude_id then
-      local pane_ok, pane = pcall(function()
-        return mux_window:active_pane()
-      end)
-
-      if pane_ok and pane and M.pane_domain(pane) == domain_name then
-        table.insert(result, mux_window)
-      end
-    end
-  end
-
-  return result
-end
-
--- Apres rattachement d'un domaine mux (local ou distant), trois cas :
---   - une session y etait vivante : attach l'a reflechie en fenetres locales,
---     on s'y pose ;
---   - rien de reflechi mais la fenetre courante tourne deja sur ce domaine
---     (cas normal du mux local) : il n'y a rien a adopter ;
---   - rien de vivant : on demarre une session sur le domaine vise.
--- attach() etant asynchrone, on laisse un court delai aux fenetres reflechies
--- avant de conclure.
+-- AUCUN handler `gui-startup` ici, et c'est DELIBERE : sa seule presence inhibe
+-- la creation de la fenetre par defaut de WezTerm, qu'il faudrait alors spawner
+-- soi-meme. Sans handler, WezTerm ouvre sa fenetre sur `default_domain`, donc
+-- sur le domaine integre — panes dans le process GUI, aucun mux-server sollicite.
 --
--- AUCUNE fenetre n'est fermee ici : depuis que le mux local est le domaine par
--- defaut, la fenetre d'ou part le selecteur est une session VIVANTE. L'ancienne
--- fermeture automatique (« fenetre d'amorcage ») tuerait de vrais panes.
-local function adopt_domain_session(window, pane, domain_name, attempts)
-  attempts = attempts or 0
-  local reflected = windows_on_domain(domain_name, mux_window_id(window))
-
-  if #reflected > 0 then
-    focus_mux_window(reflected[1])
-    return
-  end
-
-  local current_ok, current_pane = pcall(function()
-    return window:active_pane()
-  end)
-
-  if current_ok and current_pane and M.pane_domain(current_pane) == domain_name then
-    notify.info(window, 'Session ' .. M.label(domain_name) .. ' active')
-    return
-  end
-
-  -- Budget d'attente selon la MACHINE : rattacher le mux local est immediat,
-  -- rattacher vibe passe par une poignee de main TLS sur le reseau. Conclure
-  -- « aucune session vivante » trop tot ferait ouvrir un workspace `vibe` neuf
-  -- alors que la session existe — elle apparaitrait juste apres, en doublon.
-  local budget = M.is_remote(domain_name) and attach_attempts_remote or attach_attempts
-
-  if attempts < budget and wezterm.time and wezterm.time.call_after then
-    wezterm.time.call_after(attach_retry, function()
-      adopt_domain_session(window, pane, domain_name, attempts + 1)
-    end)
-    return
-  end
-
-  -- Mux LOCAL sans session : on ouvre une fenetre dedans, sans creer de
-  -- workspace nomme d'apres le domaine (contrairement au distant ci-dessous) —
-  -- sur ce PC, un demarrage a vide doit rester le workspace courant,
-  -- typiquement 'default'.
-  if M.is_local(domain_name) then
-    local spawned = pcall(function()
-      wezterm.mux.spawn_window { domain = M.spawn_domain(domain_name) }
-    end)
-
-    if spawned then
-      notify.info(window, 'Session locale persistante demarree')
-      return
-    end
-  end
-
-  window:perform_action(
-    wezterm.action.SwitchToWorkspace {
-      name = domain_name,
-      spawn = { domain = M.spawn_domain(domain_name) },
-    },
-    pane
-  )
-
-  notify.info(window, 'Session ' .. M.label(domain_name) .. ' demarree')
-end
-
--- Selecteur « ou travailler ? ». Affiche au demarrage, et rejouable a la main.
--- Les deux cibles sont des domaines mux : meme traitement, y compris pour le mux
--- local (rattachement puis reprise de la session vivante s'il y en a une).
-function M.prompt_target(window, pane)
-  M.choose(window, pane, 'Ou travailler ?', function(win, p, name)
-    local ok, err = M.ensure_attached(name)
-
-    if not ok then
-      notify.error(win, 'Connexion a ' .. M.label(name) .. ' impossible ('
-        .. tostring(err) .. '), session courante conservee')
-      return
-    end
-
-    M.set_window_default(win, name)
-    adopt_domain_session(win, p, name, 0)
-  end)
-end
-
--- NE PAS ajouter de handler `mux-startup` en esperant supprimer la fenetre que
--- le mux-server spawne a son demarrage : verifie sous Windows, l'evenement se
--- declenche bien (avec 0 fenetre a cet instant) mais le spawn par defaut a lieu
--- ensuite quand meme — contrairement a `gui-startup`, il n'est pas inhibe par la
--- presence d'un handler. Cette fenetre est celle que le GUI adopte au demarrage.
-
--- Aucune fenetre n'est creee ici dans le cas normal : `default_domain` etant le
--- mux local, WezTerm rattache le serveur de lui-meme au demarrage et reflechit
--- ses fenetres vivantes. Toute fenetre spawnee ici ferait DOUBLON — elle
--- s'ouvrait puis se refermait sous les yeux de l'utilisateur, et quand elle
--- partait dans le mux elle y restait (4 fenetres au 4e demarrage).
---
--- Le rattachement etant asynchrone, on verifie apres coup qu'une fenetre est
--- bien apparue, et on en ouvre une dans le mux si ce n'est pas le cas (mux
--- joignable mais sans aucune fenetre : session precedente entierement fermee).
--- Repli ultime sur le domaine integre pour ne jamais rester sans fenetre.
---
--- Ce filet ne couvre PAS le mux injoignable : WezTerm se connecte au domaine par
--- defaut avant tout et se termine si ca echoue, aucun timer Lua ne s'execute
--- alors (cf. `M.local_mux_enabled`).
-local function ensure_session_window(attempts)
-  attempts = attempts or 0
-
-  local ok, windows = pcall(function()
-    return wezterm.gui.gui_windows()
-  end)
-
-  if ok and type(windows) == 'table' and #windows > 0 then
-    wezterm.GLOBAL[STARTUP_PROMPT_FLAG] = true
-    return
-  end
-
-  if attempts < startup_window_attempts and wezterm.time and wezterm.time.call_after then
-    wezterm.time.call_after(startup_window_retry, function()
-      ensure_session_window(attempts + 1)
-    end)
-    return
-  end
-
-  for _, name in ipairs { M.LOCAL_MUX, M.LOCAL } do
-    local spawned = pcall(function()
-      wezterm.mux.spawn_window { domain = M.spawn_domain(name) }
-    end)
-
-    if spawned then
-      wezterm.GLOBAL[STARTUP_PROMPT_FLAG] = true
-      return
-    end
-  end
-
-  wezterm.GLOBAL[STARTUP_PROMPT_FLAG] = true
-end
-
-wezterm.on('gui-startup', function(cmd)
-  if cmd then
-    -- Lancement explicite (`wezterm start -- prog`, `wezterm connect ...`) :
-    -- on respecte la demande sans poser de question.
-    pcall(function()
-      wezterm.mux.spawn_window(cmd)
-    end)
-    return
-  end
-
-  -- Le selecteur n'est arme qu'une fois la fenetre de session la : pose dans une
-  -- fenetre transitoire, il disparaitrait avec elle.
-  wezterm.GLOBAL[STARTUP_PROMPT_FLAG] = false
-
-  if wezterm.time and wezterm.time.call_after then
-    ensure_session_window(0)
-  else
-    wezterm.GLOBAL[STARTUP_PROMPT_FLAG] = true
-  end
-end)
-
--- Le selecteur exige une GuiWindow, qui n'existe pas encore au moment de
--- `gui-startup` : c'est `update-status` qui l'apporte, des le premier rendu.
--- Le drapeau one-shot evite tout double affichage (et un reload de config ne doit
--- pas reposer la question).
-wezterm.on('update-status', function(window, pane)
-  if not wezterm.GLOBAL[STARTUP_PROMPT_FLAG] then
-    return
-  end
-
-  wezterm.GLOBAL[STARTUP_PROMPT_FLAG] = false
-  M.prompt_target(window, pane)
-end)
+-- Il n'y a pas non plus de selecteur au demarrage. Le choix du serveur est une
+-- question de CREATION de workspace (ALT+n), pas de lancement du terminal : on
+-- demarre toujours en local, et c'est en creant un workspace qu'on decide s'il
+-- vit dans le mux de ce PC ou sur vibe.
 
 function M.apply(config)
   -- 'vibe' = machine distante (cf. .env / VIBE_TLS_SETUP.md) avec un
@@ -583,15 +345,21 @@ function M.apply(config)
     { name = M.LOCAL_MUX },
   }
 
-  -- Defaut = mux local, et PAS de default_gui_startup_args : le rattachement a
-  -- vibe passe par le selecteur de demarrage (gui-startup ci-dessus) ou par
-  -- ALT+SHIFT+D, jamais automatiquement.
+  -- Defaut = domaine INTEGRE. WezTerm demarre donc sans solliciter le moindre
+  -- mux-server : pas de socket a joindre, pas de serveur a lancer, pas de
+  -- session a refleter — et donc aucune des facons de rater ce rattachement.
   --
-  -- ATTENTION : WezTerm rattache ce domaine au demarrage et se TERMINE s'il n'y
-  -- arrive pas. C'est acceptable pour le mux local (demarre a la demande, sur
-  -- cette machine) mais ne le serait pas pour vibe. D'ou `local_mux_enabled` :
-  -- le seul moyen de rouvrir WezTerm si le mux local est casse.
-  config.default_domain = M.local_mux_enabled() and M.LOCAL_MUX or M.LOCAL
+  -- Un domaine mux n'entre en jeu qu'a la CREATION d'un workspace (ALT+n, qui
+  -- demande lequel) ou a l'ouverture d'un workspace enregistre, qui porte son
+  -- domaine. `unix_domains` n'a pas `connect_automatically` : le mux local n'est
+  -- demarre qu'a la demande, au premier spawn qui le vise.
+  --
+  -- Contrepartie assumee : les panes du workspace de passage `default` vivent
+  -- dans le process GUI et meurent avec lui. C'est le prix d'un demarrage qui ne
+  -- peut pas echouer — WezTerm se TERMINE au lancement si son domaine par defaut
+  -- est injoignable, ce qui etait le risque permanent de `default_domain =
+  -- localmux`. Un workspace nomme, lui, est toujours dans un mux.
+  config.default_domain = M.LOCAL
 
   -- Shell des panes LOCAUX. Sous Windows, le defaut WezTerm est cmd.exe : on
   -- lance PowerShell directement, comme sur vibe, en chargeant l'integration
