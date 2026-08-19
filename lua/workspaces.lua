@@ -1050,6 +1050,24 @@ local function arm_auto_save()
   end)
 end
 
+-- Recensement des fenetres, ecrit au journal a chaque ouverture de workspace.
+-- Instrumentation PERMANENTE et bon marche (deux compteurs), posee le
+-- 2026-08-19 : l'echantillonnage depuis l'exterieur ratait systematiquement
+-- l'instant du symptome. Elle repond a la seule question qui restait ouverte —
+-- « la fenetre qui apparait est-elle une fenetre de plus, ou la meme
+-- recreee ? » — sans dependre du moment ou l'utilisateur teste.
+local function log_window_census(tag, name)
+  local seen, guis = pcall(function()
+    return wezterm.gui.gui_windows()
+  end)
+
+  local gui_count = (seen and type(guis) == 'table') and #guis or -1
+
+  append_debug('recensement ' .. tag .. ' name=' .. tostring(name)
+    .. ' fenetres_gui=' .. gui_count
+    .. ' fenetres_mux=' .. #workspace_mux_windows(name))
+end
+
 -- ---------------------------------------------------------------------------
 -- Expulsion des fenetres INTRUSES
 --
@@ -1083,6 +1101,49 @@ local function window_domain(mux_window)
   return domains.pane_domain(pane)
 end
 
+-- Une fenetre d'AMORCAGE de mux-server : un seul onglet, un seul pane, pose a la
+-- racine du profil utilisateur. C'est la signature exacte de ce que le serveur
+-- spawne pour lui-meme au demarrage, et ca ne ressemble a rien de ce qu'un
+-- utilisateur construit (on ne travaille pas depuis `C:\Users\<moi>` avec un
+-- pane unique dans un workspace ou l'on vient d'arriver).
+--
+-- La reconnaitre permet de la faire PARTIR au lieu de la parquer : `MuxWindow`
+-- n'a ni `close` ni `kill`, mais son shell, lui, sait sortir — et
+-- `exit_behavior = 'Close'` (cf. lua/options.lua) referme le pane, donc l'onglet,
+-- donc la fenetre. Le `exit` n'est envoye qu'a un pane repondant a TOUS les
+-- criteres ci-dessus : jamais a un pane ou quelque chose tourne.
+local function is_bootstrap_window(mux_window)
+  local ok, tabs = pcall(function()
+    return mux_window:tabs()
+  end)
+
+  if not ok or type(tabs) ~= 'table' or #tabs ~= 1 then
+    return nil
+  end
+
+  local listed, panes = pcall(function()
+    return tabs[1]:panes()
+  end)
+
+  if not listed or type(panes) ~= 'table' or #panes ~= 1 then
+    return nil
+  end
+
+  local pane = panes[1]
+  local cwd = pane_cwd(pane, pane_title(pane))
+
+  if type(cwd) ~= 'string' then
+    return nil
+  end
+
+  -- `C:\Users\quelquun` et rien de plus profond, quelle que soit la casse.
+  if cwd:match('^%a:[/\]+[Uu][Ss][Ee][Rr][Ss][/\]+[^/\]+[/\]?$') then
+    return pane
+  end
+
+  return nil
+end
+
 local function evict_foreign_windows()
   if not (wezterm.mux and wezterm.mux.all_windows) then
     return
@@ -1107,13 +1168,23 @@ local function evict_foreign_windows()
       local actual = window_domain(mux_window)
 
       if expected and actual and expected ~= actual then
+        local bootstrap = is_bootstrap_window(mux_window)
         local moved = pcall(function()
           mux_window:set_workspace(scratch_workspace)
         end)
 
         append_debug('fenetre intruse ecartee de ' .. tostring(host_workspace)
           .. ' (domaine ' .. tostring(actual) .. ' au lieu de ' .. tostring(expected)
-          .. ') ok=' .. tostring(moved))
+          .. ') ok=' .. tostring(moved)
+          .. ' amorcage=' .. tostring(bootstrap ~= nil))
+
+        -- Fenetre d'amorcage : on la fait sortir pour de bon plutot que de la
+        -- laisser s'accumuler dans le workspace de passage.
+        if bootstrap then
+          pcall(function()
+            bootstrap:send_text('exit')
+          end)
+        end
       end
     end
   end
@@ -1425,6 +1496,15 @@ end
 local function restore_workspace(window, pane, workspace)
   append_debug('restore start name=' .. tostring(workspace.name)
     .. ' domain=' .. tostring(workspace.domain))
+  log_window_census('avant', workspace.name)
+
+  -- Second recensement une fois tout retombe : c'est l'ecart entre les deux qui
+  -- dit si une fenetre a ete AJOUTEE ou simplement recreee.
+  if wezterm.time and wezterm.time.call_after then
+    wezterm.time.call_after(2, function()
+      log_window_census('apres', workspace.name)
+    end)
+  end
 
   -- Un domaine mux detache refuse tout spawn : le rattacher AVANT de restaurer,
   -- sinon le workspace s'ouvre vide. Le premier workspace distant ouvert depuis
