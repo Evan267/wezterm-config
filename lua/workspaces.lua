@@ -1303,7 +1303,26 @@ local function watch_tick()
   end
 end
 
+-- DESACTIVEE le 2026-08-19, apres un gel complet du GUI.
+--
+-- Cette surveillance balayait toutes les fenetres mux toutes les 0,5 s pendant
+-- 25 s apres chaque rattachement, en lisant le repertoire de CHAQUE pane. Sur
+-- un pane distant, cette lecture est un aller-retour reseau synchrone sur le
+-- thread GUI. Combinee a la boucle de sauvegarde (qui fait deja le tour de tous
+-- les panes vivants), elle a fige WezTerm : `Responding=False`, journal arrete
+-- net au milieu d'une capture.
+--
+-- Ce qu'elle corrigeait est COSMETIQUE (la fenetre d'amorcage d'un mux-server
+-- importee au rattachement). Un terminal qui repond passe avant. Le code reste
+-- en place : le reactiver suppose d'abord de rendre le balayage bon marche —
+-- ne jamais lire le cwd d'un pane distant a cette cadence.
+local EVICTION_ENABLED = false
+
 local function watch_for_foreign_windows()
+  if not EVICTION_ENABLED then
+    return
+  end
+
   local already_watching = false
   local until_when = wezterm.GLOBAL[eviction_watch_flag]
 
