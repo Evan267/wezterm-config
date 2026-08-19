@@ -63,6 +63,22 @@ function M.apply(config)
     config.font = wezterm.font('JetBrains Mono')
     config.status_update_interval = 1000
     config.exit_behavior = 'Close'
+
+    -- TAILLE INITIALE des fenetres. Sans elle, WezTerm en cree a 80x24 — et
+    -- depuis que la restauration cree la fenetre du workspace elle-meme (via
+    -- `wezterm.mux.spawn_window`, pour ne jamais laisser le GUI sans fenetre a
+    -- afficher), c'est cette taille-la que recoivent tous les workspaces
+    -- restaures. Couper 80 colonnes avec un ratio capture a 79/79 donne alors un
+    -- pane de UNE colonne : mesure le 2026-08-19 sur `modif-order` et
+    -- `planning_tools`, illisibles. Les panes distants, eux, sont redimensionnes
+    -- a la taille de la fenetre du client : une fenetre etroite ecrase la session
+    -- entiere, y compris sur vibe.
+    --
+    -- Ce n'est PAS une taille de pane figee : les coupes restent des ratios (cf.
+    -- `apply_layout`). C'est la taille de depart de la fenetre, que WezTerm
+    -- ajuste ensuite.
+    config.initial_cols = 159
+    config.initial_rows = 40
     -- Domaines (tls_clients, default_domain, selecteur de demarrage) : voir
     -- lua/domains.lua. Ils ne sont plus declares ici.
 
