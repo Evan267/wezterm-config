@@ -1053,328 +1053,80 @@ local auto_save_generation_flag = 'workspace_auto_save_generation'
 local auto_save_heartbeat_flag = 'workspace_auto_save_heartbeat'
 -- Sans battement depuis 3 scrutations, la boucle est declaree morte et rearmee.
 -- Large expres : une tick lente ne doit pas creer de doublon.
-local auto_save_liveness_timeout = 3 * auto_save_interval
-
-local function auto_save_tick(generation)
-  -- Une boucle plus recente a pris le relais : celle-ci s'arrete, sinon les deux
-  -- scruteraient en parallele.
-  if wezterm.GLOBAL[auto_save_generation_flag] ~= generation then
-    return
-  end
-
-  wezterm.GLOBAL[auto_save_heartbeat_flag] = os.time()
-
-  local ok, err = pcall(refresh_saved_workspaces)
-
-  if not ok then
-    append_debug('auto-save erreur: ' .. tostring(err))
-  end
-
-  if wezterm.time and wezterm.time.call_after then
-    wezterm.time.call_after(auto_save_interval, function()
-      auto_save_tick(generation)
-    end)
-  end
-end
-
--- Amorce la boucle si aucune ne bat. Idempotent et bon marche : appelable a
--- chaque `update-status` pour le prix d'une lecture de GLOBAL.
---
--- Un reload de config TUE les timers en vol, et sur ce depot il y en a a chaque
--- ecriture dans `config_dir` — ou vit justement `workspaces.json`. Une boucle
--- armee une seule fois est donc une boucle morte : d'ou le battement de coeur
--- plutot qu'un drapeau « demarree » definitif.
-local function arm_auto_save()
-  if not (wezterm.time and wezterm.time.call_after) then
-    return
-  end
-
-  local heartbeat = wezterm.GLOBAL[auto_save_heartbeat_flag]
-
-  if type(heartbeat) == 'number' and (os.time() - heartbeat) < auto_save_liveness_timeout then
-    return
-  end
-
-  local generation = (tonumber(wezterm.GLOBAL[auto_save_generation_flag]) or 0) + 1
-
-  wezterm.GLOBAL[auto_save_generation_flag] = generation
-  wezterm.GLOBAL[auto_save_heartbeat_flag] = os.time()
-  append_debug('auto-save armee generation=' .. generation .. ' cadence=' .. auto_save_interval .. 's')
-
-  wezterm.time.call_after(auto_save_interval, function()
-    auto_save_tick(generation)
-  end)
-end
-
--- Recensement des fenetres, ecrit au journal a chaque ouverture de workspace.
--- Instrumentation PERMANENTE et bon marche (deux compteurs), posee le
--- 2026-08-19 : l'echantillonnage depuis l'exterieur ratait systematiquement
--- l'instant du symptome. Elle repond a la seule question qui restait ouverte —
--- « la fenetre qui apparait est-elle une fenetre de plus, ou la meme
--- recreee ? » — sans dependre du moment ou l'utilisateur teste.
-local function log_window_census(tag, name)
-  local seen, guis = pcall(function()
-    return wezterm.gui.gui_windows()
-  end)
-
-  local gui_count = (seen and type(guis) == 'table') and #guis or -1
-
-  append_debug('recensement ' .. tag .. ' name=' .. tostring(name)
-    .. ' fenetres_gui=' .. gui_count
-    .. ' fenetres_mux=' .. #workspace_mux_windows(name))
-end
-
 -- ---------------------------------------------------------------------------
--- Expulsion des fenetres INTRUSES
+-- Sauvegarde a l'EVENEMENT, pas au chronometre
 --
--- Un `wezterm-mux-server` spawne une fenetre pour lui-meme a son demarrage (ce
--- n'est pas evitable : un handler `mux-startup` ne l'inhibe pas, contrairement a
--- `gui-startup`). Au rattachement du domaine, WezTerm importe les fenetres du
--- serveur — celle-la comprise — et la place dans le workspace ACTIF a cet
--- instant. Elle atterrit donc en plein milieu du workspace qu'on est en train
--- d'ouvrir, une fois par domaine et par session. C'est la « fenetre qui s'ouvre
--- a la premiere connexion » rapportee le 2026-08-19, et le registre du jour en
--- garde deux traces : un pane `vibe` (cwd HOME de vibe) dans `chaud-devant`, qui
--- est un workspace localmux, et un pwsh `localmux` au HOME dans `modif-order`,
--- qui est un workspace vibe.
+-- L'ancienne boucle capturait TOUS les workspaces vivants toutes les 60 s. Deux
+-- defauts, mesures le 2026-08-19 :
+--   - elle lisait le repertoire de chaque pane, donc un aller-retour reseau
+--     synchrone par pane distant, sur le thread GUI ;
+--   - elle enregistrait a l'aveugle, y compris un workspace momentanement
+--     pollue par une fenetre etrangere — c'est ainsi que la disposition de
+--     `modif-order` a ete detruite deux fois.
 --
--- Le critere n'est PAS heuristique : une fenetre dont les panes ne tournent pas
--- sur le domaine du workspace n'a rien a y faire. Un workspace legitime a toutes
--- ses fenetres sur son propre domaine, par construction.
+-- Desormais on n'enregistre QUE le workspace qu'on vient de modifier, et
+-- seulement quand quelque chose a change : split, nouvel onglet, renommage,
+-- ouverture d'un workspace, changement de repertoire annonce par le shell.
 --
--- On DEPLACE, on ne ferme pas : `MuxWindow` n'expose de toute facon ni `close`
--- ni `kill`. La fenetre part dans le workspace de passage, ou elle ne gene
--- personne et reste accessible.
-local function window_domain(mux_window)
-  local ok, pane = pcall(function()
-    return mux_window:active_pane()
-  end)
+-- Debounce : une action en declenche souvent plusieurs (un split emet aussi un
+-- changement de cwd). On coalesce, et on laisse le temps au nouveau pane
+-- d'exister avant de le capturer.
+local save_debounce = 2
+local pending_saves = {}
 
-  if not ok or not pane then
-    return nil
-  end
+local function capture_workspace_now(name)
+  pending_saves[name] = nil
 
-  return domains.pane_domain(pane)
-end
-
--- Une fenetre d'AMORCAGE de mux-server : un seul onglet, un seul pane, pose a la
--- racine du profil utilisateur. C'est la signature exacte de ce que le serveur
--- spawne pour lui-meme au demarrage, et ca ne ressemble a rien de ce qu'un
--- utilisateur construit (on ne travaille pas depuis `C:\Users\<moi>` avec un
--- pane unique dans un workspace ou l'on vient d'arriver).
---
--- La reconnaitre permet de la faire PARTIR au lieu de la parquer : `MuxWindow`
--- n'a ni `close` ni `kill`, mais son shell, lui, sait sortir — et
--- `exit_behavior = 'Close'` (cf. lua/options.lua) referme le pane, donc l'onglet,
--- donc la fenetre. Le `exit` n'est envoye qu'a un pane repondant a TOUS les
--- criteres ci-dessus : jamais a un pane ou quelque chose tourne.
-local function is_bootstrap_window(mux_window)
-  local ok, tabs = pcall(function()
-    return mux_window:tabs()
-  end)
-
-  if not ok or type(tabs) ~= 'table' or #tabs ~= 1 then
-    return nil
-  end
-
-  local listed, panes = pcall(function()
-    return tabs[1]:panes()
-  end)
-
-  if not listed or type(panes) ~= 'table' or #panes ~= 1 then
-    return nil
-  end
-
-  local pane = panes[1]
-  local cwd = pane_cwd(pane, pane_title(pane))
-
-  if type(cwd) ~= 'string' then
-    return nil
-  end
-
-  -- `C:\Users\quelquun` et rien de plus profond, quelle que soit la casse.
-  -- Separateurs normalises AVANT le motif : ecrire un antislash dans un
-  -- motif Lua demande un echappement, source d'erreurs (une occurrence
-  -- mal echappee a casse le chargement du module le 2026-08-19).
-  local normalized = cwd:gsub(string.char(92), '/')
-
-  if normalized:match('^%a:/+[Uu][Ss][Ee][Rr][Ss]/+[^/]+/?$') then
-    return pane
-  end
-
-  return nil
-end
-
-local function evict_foreign_windows()
-  if not (wezterm.mux and wezterm.mux.all_windows) then
+  if not is_saveable_workspace(name) then
     return
   end
 
-  local listed, mux_windows = pcall(wezterm.mux.all_windows)
+  for _, mux_window in ipairs(workspace_mux_windows(name)) do
+    local captured, snapshot = pcall(capture_mux_window, mux_window, nil)
 
-  if not listed or type(mux_windows) ~= 'table' then
-    return
-  end
-
-  local registry = load_registry()
-
-  for _, mux_window in ipairs(mux_windows) do
-    local named, host_workspace = pcall(function()
-      return mux_window:get_workspace()
-    end)
-
-    -- Workspace de PASSAGE : c'est la qu'atterrissent les fenetres d'amorcage
-    -- importees au rattachement d'un domaine, une par serveur — donc « un
-    -- wezterm-gui par connexion » a l'ouverture (rapporte le 2026-08-19). On les
-    -- fait sortir.
-    --
-    -- La fenetre du GUI lui-meme y est AUSSI, et elle a la meme forme (un
-    -- onglet, un pane, au HOME). Ce qui les separe est le DOMAINE : celle du GUI
-    -- tourne sur le domaine integre, les intruses sur un mux. Ne jamais relacher
-    -- ce test, c'est lui qui protege la fenetre de l'utilisateur.
-    if named and host_workspace == scratch_workspace then
-      local actual = window_domain(mux_window)
-
-      if actual and actual ~= domains.LOCAL then
-        local bootstrap = is_bootstrap_window(mux_window)
-
-        if bootstrap then
-          append_debug('fenetre d amorcage ecartee de ' .. tostring(host_workspace)
-            .. ' (domaine ' .. tostring(actual) .. ')')
-
-          -- D'ABORD hors du champ : instantane, et sans dependre du shell.
-          pcall(function()
-            mux_window:set_workspace(parking_workspace)
-          end)
-
-          -- ENSUITE on la libere pour de bon. Si le shell ne repond pas, elle
-          -- reste garee la ou personne ne la voit : le pire cas est propre.
-          pcall(function()
-            bootstrap:send_text('exit' .. string.char(13))
-          end)
-        end
-      end
-    elseif named then
-      local entry = find_workspace(registry, host_workspace)
-      local expected = entry and domains.normalize(entry.domain)
-      local actual = window_domain(mux_window)
-
-      if expected and actual and expected ~= actual then
-        local bootstrap = is_bootstrap_window(mux_window)
-
-        -- ON NE DEPLACE QUE LES FENETRES D'AMORCAGE. Le domaine qui ne colle pas
-        -- suffit a dire « cette fenetre n'a rien a faire ici », pas a dire ou
-        -- elle devrait etre. Le 2026-08-19, une VRAIE session (chaud-devant, 3
-        -- panes) s'etait retrouvee etiquetee `modif-order` : la deplacer l'a
-        -- sortie du champ au lieu de la rendre a son workspace. Une session
-        -- vivante ne se deplace pas sur un simple soupcon — on la signale.
-        if not bootstrap then
-          append_debug('fenetre etrangere signalee dans ' .. tostring(host_workspace)
-            .. ' (domaine ' .. tostring(actual) .. ' au lieu de ' .. tostring(expected)
-            .. ') : laissee en place, ce n est pas une fenetre d amorcage')
-        else
-          local moved = pcall(function()
-            mux_window:set_workspace(parking_workspace)
-          end)
-
-          append_debug('fenetre d amorcage ecartee de ' .. tostring(host_workspace)
-            .. ' (domaine ' .. tostring(actual) .. ' au lieu de ' .. tostring(expected)
-            .. ') ok=' .. tostring(moved))
-
-          pcall(function()
-            bootstrap:send_text('exit' .. string.char(13))
-          end)
-        end
-      end
+    if not captured then
+      append_debug('capture erreur name=' .. tostring(name) .. ': ' .. tostring(snapshot))
+    elseif snapshot_has_content(snapshot) then
+      pcall(upsert_workspace, name, snapshot)
+      return
     end
   end
 end
 
--- L'import des fenetres distantes est asynchrone : on repasse peu apres.
--- SURVEILLANCE BORNEE plutot que quelques passes minutees. L'import des fenetres
--- d'un domaine est asynchrone, et son delai n'est pas previsible : rattacher un
--- mux deja demarre est immediat, mais en DEMARRER un prend plusieurs secondes.
--- Mesure le 2026-08-19 : des passes s'arretant a 2,5 s rataient l'import qui
--- suivait le demarrage du mux local, et la fenetre d'amorcage restait — dans
--- `modif-order`, le workspace actif a cet instant, qui s'est retrouve a deux
--- fenetres.
---
--- On ouvre donc une fenetre de surveillance apres chaque rattachement, balayee a
--- chaque `update-status` (soit environ une fois par seconde). Le balayage ne
--- coute qu'un parcours des fenetres mux ; hors surveillance il ne coute qu'une
--- comparaison d'horodatage.
--- La surveillance bat sur des TIMERS, pas sur `update-status`. L'evenement ne
--- tire pas de facon fiable quand la fenetre n'a pas le focus — et c'est
--- precisement le cas au demarrage, ou l'utilisateur regarde ailleurs pendant que
--- les domaines se rattachent. Une fenetre d'amorcage importee restait alors en
--- place faute de battement (constate le 2026-08-19 : surveillance armee a
--- 22:22:38, fenetre toujours dans `default` deux minutes plus tard).
-local eviction_watch_flag = 'workspace_eviction_watch_until'
-local eviction_watch_seconds = 25
-local eviction_watch_interval = 0.5
+-- Point d'entree unique : « ce workspace a bouge, enregistre-le bientot ».
+local function save_soon(name)
+  name = canonical_workspace_name(name)
 
-local function watch_tick()
-  local until_when = wezterm.GLOBAL[eviction_watch_flag]
-
-  if type(until_when) ~= 'number' or os.time() >= until_when then
+  if not is_saveable_workspace(name) or pending_saves[name] then
     return
   end
 
-  -- L'erreur est JOURNALISEE. Un pcall muet ici a masque pendant des heures un
-  -- appel a une fonction inexistante : l'expulsion ne faisait rien et rien ne le
-  -- disait.
-  local ok, err = pcall(evict_foreign_windows)
-
-  if not ok then
-    append_debug('expulsion erreur: ' .. tostring(err))
-  end
-
-  if wezterm.time and wezterm.time.call_after then
-    wezterm.time.call_after(eviction_watch_interval, watch_tick)
-  end
-end
-
--- DESACTIVEE le 2026-08-19, apres un gel complet du GUI.
---
--- Cette surveillance balayait toutes les fenetres mux toutes les 0,5 s pendant
--- 25 s apres chaque rattachement, en lisant le repertoire de CHAQUE pane. Sur
--- un pane distant, cette lecture est un aller-retour reseau synchrone sur le
--- thread GUI. Combinee a la boucle de sauvegarde (qui fait deja le tour de tous
--- les panes vivants), elle a fige WezTerm : `Responding=False`, journal arrete
--- net au milieu d'une capture.
---
--- Ce qu'elle corrigeait est COSMETIQUE (la fenetre d'amorcage d'un mux-server
--- importee au rattachement). Un terminal qui repond passe avant. Le code reste
--- en place : le reactiver suppose d'abord de rendre le balayage bon marche —
--- ne jamais lire le cwd d'un pane distant a cette cadence.
-local EVICTION_ENABLED = false
-
-local function watch_for_foreign_windows()
-  if not EVICTION_ENABLED then
+  if not (wezterm.time and wezterm.time.call_after) then
     return
   end
 
-  local already_watching = false
-  local until_when = wezterm.GLOBAL[eviction_watch_flag]
+  pending_saves[name] = true
 
-  if type(until_when) == 'number' and os.time() < until_when then
-    already_watching = true
-  end
+  wezterm.time.call_after(save_debounce, function()
+    local ok, err = pcall(capture_workspace_now, name)
 
-  wezterm.GLOBAL[eviction_watch_flag] = os.time() + eviction_watch_seconds
-
-  local ok, err = pcall(evict_foreign_windows)
-
-  if not ok then
-    append_debug('expulsion erreur: ' .. tostring(err))
-  end
-
-  -- Une seule chaine de timers a la fois : prolonger l'echeance suffit.
-  if not already_watching and wezterm.time and wezterm.time.call_after then
-    wezterm.time.call_after(eviction_watch_interval, watch_tick)
-  end
+    if not ok then
+      pending_saves[name] = nil
+      append_debug('sauvegarde erreur name=' .. tostring(name) .. ': ' .. tostring(err))
+    end
+  end)
 end
 
+-- Enregistre le workspace de la fenetre courante.
+local function save_window_soon(window)
+  local ok, name = pcall(function()
+    return window:active_workspace()
+  end)
+
+  if ok and name then
+    save_soon(name)
+  end
+end
 -- ---------------------------------------------------------------------------
 -- Prechargement des connexions, une fois par process
 --
@@ -1402,7 +1154,6 @@ local function preload_domains()
         .. ' ok=' .. tostring(ok) .. ' (' .. tostring(reason) .. ')')
 
       if ok then
-        watch_for_foreign_windows()
       end
     end
   end
@@ -1711,6 +1462,8 @@ local function restore_workspace_in_current_window(window, pane, workspace)
   )
 
   restore_layout_when_ready(window, workspace)
+  -- La disposition se pose en differe : on enregistre une fois qu'elle est la.
+  save_soon(workspace.name)
 
   return true
 end
@@ -1718,15 +1471,6 @@ end
 local function restore_workspace(window, pane, workspace)
   append_debug('restore start name=' .. tostring(workspace.name)
     .. ' domain=' .. tostring(workspace.domain))
-  log_window_census('avant', workspace.name)
-
-  -- Second recensement une fois tout retombe : c'est l'ecart entre les deux qui
-  -- dit si une fenetre a ete AJOUTEE ou simplement recreee.
-  if wezterm.time and wezterm.time.call_after then
-    wezterm.time.call_after(2, function()
-      log_window_census('apres', workspace.name)
-    end)
-  end
 
   -- Reconstruction deja en vol : on se contente de basculer dessus. En relancer
   -- une par-dessus creerait un deuxieme jeu de fenetres.
@@ -1752,8 +1496,6 @@ local function restore_workspace(window, pane, workspace)
 
   -- Le rattachement vient peut-etre d'importer la fenetre d'amorcage du serveur
   -- dans le workspace courant : on l'ecarte avant de continuer.
-  watch_for_foreign_windows()
-
   -- PAS de mode « nouvelle fenetre ». Invariant du depot : une seule fenetre
   -- ouverte a la fois. Un workspace s'ouvre la ou on est — WezTerm y revele la
   -- fenetre du workspace cible — jamais a cote.
@@ -1761,6 +1503,7 @@ local function restore_workspace(window, pane, workspace)
     append_debug('restore live switch name=' .. tostring(workspace.name))
 
     window:perform_action(wezterm.action.SwitchToWorkspace { name = workspace.name }, pane)
+    save_soon(workspace.name)
     notify(window, 'Workspace live rejoint: ' .. workspace.name)
     return
   end
@@ -1841,7 +1584,10 @@ function M.split_pane(window, pane, direction)
   if not ok then
     append_debug('split failed: ' .. tostring(err))
     notify_error(window, 'Impossible d ouvrir un pane')
+    return
   end
+
+  save_window_soon(window)
 end
 
 function M.spawn_tab(window)
@@ -1856,7 +1602,10 @@ function M.spawn_tab(window)
   if not ok then
     append_debug('spawn tab failed: ' .. tostring(err))
     notify_error(window, 'Impossible d ouvrir un tab')
+    return
   end
+
+  save_window_soon(window)
 end
 
 function M.save_current(window, pane, name)
@@ -1934,6 +1683,7 @@ function M.prompt_rename_active_tab(window, pane)
         end
 
         set_tab_title(tab, name)
+        save_window_soon(win)
         M.save_current(win, p)
       end),
     },
@@ -2230,6 +1980,16 @@ end
 --
 -- Re-enregistrer a chaque evaluation est le comportement CORRECT ici, pas une
 -- fuite : la table repart vide a chaque fois.
+-- Le shell annonce son repertoire a chaque invite (cf. shell/wezterm.ps1) : c'est
+-- le signal « quelque chose a change dans ce pane » le plus fiable dont on
+-- dispose, et il couvre le `cd` comme la fermeture d'un pane. Le debounce
+-- absorbe la rafale d'un demarrage de session.
+wezterm.on('user-var-changed', function(window, _, name)
+  if name == 'WEZTERM_WORKSPACE_CWD' then
+    save_window_soon(window)
+  end
+end)
+
 wezterm.on('update-status', function()
   -- Uniquement cote GUI. Le wezterm-mux-server local lit ce meme fichier de
   -- config ; sans ce test il tiendrait sa propre boucle de sauvegarde sur le
@@ -2238,7 +1998,6 @@ wezterm.on('update-status', function()
     return
   end
 
-  arm_auto_save()
   run_preload_once()
 end)
 
