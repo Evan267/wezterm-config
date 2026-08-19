@@ -51,6 +51,11 @@ passe par `ALT` + `SHIFT` + `r` (rejeu depuis `workspaces.json`).
   solliciter le moindre serveur mux. Aucune question n'est posee, et l'ouverture
   ne peut donc pas echouer parce qu'un serveur ne repond pas. Les panes de ce
   premier workspace (`default`) vivent dans la fenetre et meurent avec elle.
+* **Les connexions sont prechargees** : une seconde apres l'ouverture, WezTerm
+  rattache les serveurs dont vos workspaces actifs ont besoin, pour que leurs
+  sessions soient deja la quand vous basculez dessus. Un serveur qui ne repond
+  pas est simplement ignore (teste en 800 ms max) : l'ouverture n'attend jamais
+  apres lui.
 * **Le serveur se choisit a la CREATION d'un workspace** (`ALT` + `n`) : `Local`
   le fait vivre dans le `wezterm-mux-server` de ce PC, `vibe` sur le serveur
   distant. Dans les deux cas ses panes survivent a la fermeture de WezTerm. Le

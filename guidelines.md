@@ -169,6 +169,25 @@ Points de maintenance :
   La fenetre cible est desormais resolue par `workspace_mux_windows`, cote mux,
   ou le nom du workspace fait foi ; on attend la fenetre ET son pane d'accueil.
   Ne jamais reintroduire un test d'egalite de workspace sur `window:mux_window()`.
+- **Prechargement des connexions au demarrage** (`run_preload_once` ->
+  `domains.preload`) : les domaines dont les workspaces ACTIFS ont besoin sont
+  rattaches une fois par process, ~1 s apres le premier rendu, pour que leurs
+  sessions soient deja la au moment de basculer dessus. **On SONDE avant de
+  rattacher**, et c'est tout l'interet : `domain:attach()` est synchrone sur le
+  thread GUI et gele tout WezTerm le temps du timeout TCP quand la cible ne
+  repond pas (mesure le 2026-08-19 sur vibe : 12 s). Le probe, lui, a un timeout
+  qu'on choisit (800 ms, mesure a 407 ms serveur joignable).
+  - domaine distant : poignee de main TCP bornee, sans TLS — on ne cherche qu'a
+    savoir si le port repond ;
+  - mux local : on verifie qu'il TOURNE DEJA, on ne le demarre pas. Un
+    mux-server qui demarre spawne sa propre fenetre, qui apparaitrait dans le
+    workspace de passage sans que personne ne l'ait demandee. S'il est eteint il
+    n'y a rien a precharger : le premier workspace ouvert le demarrera.
+- **Les handlers d'evenement ne sont enregistres QU'UNE FOIS par process**
+  (`wezterm.GLOBAL.workspace_handlers_version`, meme garde-fou que le theme dans
+  `lua/options.lua`). Chaque rechargement de config reevalue les modules ; un
+  `wezterm.on` sans garde-fou empile un handler de plus a chaque fois, et sur ce
+  depot les rechargements sont frequents (toute ecriture dans `config_dir`).
 - **Rattachement** (`ensure_attached`) : un domaine mux **detache refuse tout
   spawn**. Toute restauration ou creation sur un domaine mux — `localmux`
   compris, seul `local` est exempt — doit appeler `domains.ensure_attached`
@@ -271,12 +290,27 @@ Le module `lua/workspaces.lua` capture/restaure les workspaces dans
   workspace cible restait une coquille vide pendant que son contenu s'ouvrait
   ailleurs. `restore_workspace_in_new_window` passe donc `workspace` et `domain`.
   Ne pas regresser.
-- **Auto-sauvegarde** (`M.start_auto_save`, demarree depuis `wezterm.lua`) :
-  boucle `wezterm.time.call_after` toutes les `auto_save_interval` s (60). Elle ne
-  rafraichit que les workspaces **deja presents** dans le registre (jamais de
-  creation implicite ; la creation reste `ALT+r`). Demarree une seule fois par
-  process via le drapeau `wezterm.GLOBAL.workspace_auto_save_started` (un reload
-  de config ne doit pas empiler une 2e boucle).
+- **Auto-sauvegarde** (`M.start_auto_save`, branchee depuis `wezterm.lua`) :
+  boucle `wezterm.time.call_after` toutes les `auto_save_interval` s (60), qui
+  rafraichit les snapshots des workspaces deja presents dans le registre.
+  - **Armee depuis un EVENEMENT, jamais depuis le scope du fichier de config.**
+    Un `wezterm.time.call_after` pose pendant l'evaluation de la config ne se
+    declenche JAMAIS. Mesure le 2026-08-18 : GUI demarre depuis 9 min, registre
+    jamais reecrit, zero ligne `enregistre` au journal. L'ancien drapeau
+    `workspace_auto_save_started` figeait en plus la panne pour de bon, en
+    interdisant tout reamorcage. `update-status` est le point d'accroche : il
+    tire des le premier rendu et rien ne l'inhibe.
+  - **Un reload de config TUE les timers en vol**, et il y en a a chaque ecriture
+    dans `config_dir` — ou vit justement `workspaces.json`. Une boucle armee une
+    seule fois est donc une boucle morte. D'ou une generation
+    (`workspace_auto_save_generation`) et un battement de coeur
+    (`workspace_auto_save_heartbeat`) dans `wezterm.GLOBAL` : `arm_auto_save` ne
+    relance que si aucun battement n'est arrive depuis 3 scrutations, et une tick
+    dont la generation n'est plus celle du GLOBAL s'arrete d'elle-meme. Deux
+    boucles ne peuvent donc pas coexister. Ne pas revenir a un drapeau booleen.
+  - **Une erreur de scrutation se journalise** (`auto-save erreur: ...`). Un
+    pcall muet ici, c'est une auto-save qui cesse de sauvegarder sans que rien ne
+    le dise — exactement ce qui est arrive le 2026-08-19.
 - **Invariant anti-ecrasement** : l'auto-save ne doit **jamais** ecraser une
   sauvegarde par un etat vide. Apres un redemarrage du mux-server, les panes
   morts sont filtres (pcall par pane dans `capture_pane`) et le snapshot devient

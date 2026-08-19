@@ -951,12 +951,112 @@ local function refresh_saved_workspaces()
   end
 end
 
-local function auto_save_tick()
-  pcall(refresh_saved_workspaces)
+-- Generation et battement de coeur de la boucle vivante, dans `wezterm.GLOBAL`
+-- pour survivre aux rechargements de config (qui reconstruisent tout l'etat Lua).
+local auto_save_generation_flag = 'workspace_auto_save_generation'
+local auto_save_heartbeat_flag = 'workspace_auto_save_heartbeat'
+-- Sans battement depuis 3 scrutations, la boucle est declaree morte et rearmee.
+-- Large expres : une tick lente ne doit pas creer de doublon.
+local auto_save_liveness_timeout = 3 * auto_save_interval
+
+local function auto_save_tick(generation)
+  -- Une boucle plus recente a pris le relais : celle-ci s'arrete, sinon les deux
+  -- scruteraient en parallele.
+  if wezterm.GLOBAL[auto_save_generation_flag] ~= generation then
+    return
+  end
+
+  wezterm.GLOBAL[auto_save_heartbeat_flag] = os.time()
+
+  local ok, err = pcall(refresh_saved_workspaces)
+
+  if not ok then
+    append_debug('auto-save erreur: ' .. tostring(err))
+  end
 
   if wezterm.time and wezterm.time.call_after then
-    wezterm.time.call_after(auto_save_interval, auto_save_tick)
+    wezterm.time.call_after(auto_save_interval, function()
+      auto_save_tick(generation)
+    end)
   end
+end
+
+-- Amorce la boucle si aucune ne bat. Idempotent et bon marche : appelable a
+-- chaque `update-status` pour le prix d'une lecture de GLOBAL.
+--
+-- Un reload de config TUE les timers en vol, et sur ce depot il y en a a chaque
+-- ecriture dans `config_dir` — ou vit justement `workspaces.json`. Une boucle
+-- armee une seule fois est donc une boucle morte : d'ou le battement de coeur
+-- plutot qu'un drapeau « demarree » definitif.
+local function arm_auto_save()
+  if not (wezterm.time and wezterm.time.call_after) then
+    return
+  end
+
+  local heartbeat = wezterm.GLOBAL[auto_save_heartbeat_flag]
+
+  if type(heartbeat) == 'number' and (os.time() - heartbeat) < auto_save_liveness_timeout then
+    return
+  end
+
+  local generation = (tonumber(wezterm.GLOBAL[auto_save_generation_flag]) or 0) + 1
+
+  wezterm.GLOBAL[auto_save_generation_flag] = generation
+  wezterm.GLOBAL[auto_save_heartbeat_flag] = os.time()
+  append_debug('auto-save armee generation=' .. generation .. ' cadence=' .. auto_save_interval .. 's')
+
+  wezterm.time.call_after(auto_save_interval, function()
+    auto_save_tick(generation)
+  end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Prechargement des connexions, une fois par process
+--
+-- Rattache les domaines dont les workspaces ACTIFS ont besoin, pour que leurs
+-- sessions soient deja la quand on bascule dessus au lieu d'etre rattachees dans
+-- l'urgence d'une frappe. `domains.preload` sonde avant de rattacher : il ne
+-- demarre pas le mux local s'il est eteint et ne touche pas a un serveur distant
+-- qui ne repond pas, donc aucun risque de gel.
+--
+-- Le delai laisse la premiere fenetre s'afficher : meme court, un probe reste du
+-- travail synchrone sur le thread GUI.
+local preload_flag = 'workspace_preload_done'
+local preload_delay = 1
+
+local function preload_domains()
+  local seen = {}
+
+  for _, workspace in ipairs(list_workspaces(load_registry(), 'active')) do
+    local domain = domains.normalize(workspace.domain)
+
+    if domain and not seen[domain] then
+      seen[domain] = true
+      local ok, reason = domains.preload(domain)
+      append_debug('prechargement domaine=' .. domain
+        .. ' ok=' .. tostring(ok) .. ' (' .. tostring(reason) .. ')')
+    end
+  end
+end
+
+local function run_preload_once()
+  if wezterm.GLOBAL[preload_flag] then
+    return
+  end
+
+  wezterm.GLOBAL[preload_flag] = true
+
+  if not (wezterm.time and wezterm.time.call_after) then
+    return
+  end
+
+  wezterm.time.call_after(preload_delay, function()
+    local ok, err = pcall(preload_domains)
+
+    if not ok then
+      append_debug('prechargement erreur: ' .. tostring(err))
+    end
+  end)
 end
 
 local function bounds(panes)
@@ -1766,17 +1866,41 @@ end
 
 -- Demarre la boucle d'auto-sauvegarde (une seule fois par process, meme apres un
 -- reload de config, grace au drapeau GLOBAL).
+-- Branche l'auto-sauvegarde et le prechargement sur `update-status`.
+--
+-- POURQUOI UN EVENEMENT : un `wezterm.time.call_after` pose pendant
+-- l'EVALUATION DU FICHIER DE CONFIG ne se declenche JAMAIS. C'est ce que faisait
+-- l'ancienne version — et son drapeau `workspace_auto_save_started` figeait la
+-- panne pour de bon. Mesure le 2026-08-18 : GUI demarre depuis 9 min, registre
+-- jamais reecrit, zero ligne `enregistre` au journal. Ne JAMAIS rearmer depuis
+-- le scope du fichier de config.
+--
+-- `update-status` est l'evenement dont on est sur qu'il tire, des le premier
+-- rendu et sans rien pour l'inhiber.
+local HANDLERS_VERSION = 1
+
 function M.start_auto_save()
-  if wezterm.GLOBAL.workspace_auto_save_started then
+  -- UNIQUEMENT dans le process GUI. Le wezterm-mux-server local lit ce meme
+  -- fichier de config : sans ce garde-fou il tiendrait sa propre boucle sur le
+  -- meme registre, avec une vision partielle. `wezterm.gui` n'existe que cote
+  -- GUI (meme test que lua/options.lua pour le theme).
+  if not wezterm.gui then
     return
   end
 
-  if not (wezterm.time and wezterm.time.call_after) then
+  -- Un `wezterm.on` par rechargement de config EMPILERAIT les handlers (meme
+  -- garde-fou que le theme dans lua/options.lua) : on n'enregistre qu'une fois
+  -- par process.
+  if wezterm.GLOBAL.workspace_handlers_version == HANDLERS_VERSION then
     return
   end
 
-  wezterm.GLOBAL.workspace_auto_save_started = true
-  wezterm.time.call_after(auto_save_interval, auto_save_tick)
+  wezterm.GLOBAL.workspace_handlers_version = HANDLERS_VERSION
+
+  wezterm.on('update-status', function()
+    arm_auto_save()
+    run_preload_once()
+  end)
 end
 
 return M

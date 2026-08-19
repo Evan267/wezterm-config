@@ -37,6 +37,13 @@ WezTerm se **termine** au lancement si son `default_domain` est injoignable, et
 c'était le risque permanent de `default_domain = localmux`. Contrepartie assumée :
 les panes du workspace de passage `default` meurent avec la fenêtre.
 
+Les connexions dont les workspaces **actifs** ont besoin sont en revanche
+**préchargées** ~1 s après l'ouverture (`run_preload_once` → `domains.preload`),
+pour que leurs sessions soient déjà là au moment d'y basculer. Le préchargement
+**sonde avant de rattacher** : `domain:attach()` est synchrone et gèlerait le GUI
+le temps du timeout TCP. Le mux local n'est jamais *démarré* par le
+préchargement, seulement rejoint s'il tourne déjà.
+
 **Le choix d'un serveur est une question de création de workspace, pas de
 lancement du terminal.** Il n'y a plus de sélecteur au démarrage : `ALT+n`
 demande le domaine du nouveau workspace (mux local ou `vibe` — jamais l'intégré,

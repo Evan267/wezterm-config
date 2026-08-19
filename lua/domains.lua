@@ -171,6 +171,69 @@ function M.pane_domain(pane)
   return M.normalize(name)
 end
 
+-- ---------------------------------------------------------------------------
+-- Prechargement des connexions
+--
+-- Sonder AVANT de rattacher, parce que `domain:attach()` est SYNCHRONE sur le
+-- thread GUI : quand la cible ne repond pas, il bloque tout WezTerm le temps du
+-- timeout TCP — mesure le 2026-08-19 sur vibe, 12 s d'interface entierement
+-- gelee. Le probe, lui, a un timeout que NOUS choisissons.
+-- ---------------------------------------------------------------------------
+local PROBE_TIMEOUT_MS = 800
+
+local function child_ok(argv)
+  local ok, success = pcall(function()
+    local success = wezterm.run_child_process(argv)
+    return success
+  end)
+
+  return ok and success == true
+end
+
+-- Le mux LOCAL tourne-t-il deja ? On ne le DEMARRE pas au prechargement : un
+-- mux-server qui demarre spawne sa propre fenetre (cf. plus haut), qui
+-- apparaitrait alors dans le workspace de passage sans que personne ne l'ait
+-- demandee. S'il n'est pas la, il n'y a simplement rien a precharger — le
+-- premier workspace ouvert le demarrera.
+local function local_mux_running()
+  return child_ok {
+    'powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+    'if (Get-Process wezterm-mux-server -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }',
+  }
+end
+
+-- Poignee de main TCP bornee a PROBE_TIMEOUT_MS, sans TLS : on ne cherche qu'a
+-- savoir si le port repond, pas a valider les certificats.
+local function remote_reachable()
+  return child_ok {
+    'powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+    "$c = New-Object Net.Sockets.TcpClient; "
+      .. "try { if ($c.ConnectAsync('" .. env.VIBE_ADDR .. "', " .. env.VIBE_TLS_PORT
+      .. ").Wait(" .. PROBE_TIMEOUT_MS .. ")) { exit 0 } else { exit 1 } } catch { exit 1 } finally { $c.Close() }",
+  }
+end
+
+-- Rattache le domaine SI c'est raisonnable, sans jamais risquer un gel : le
+-- domaine integre n'a rien a rattacher, le mux local n'est rattache que s'il
+-- tourne deja, le distant que s'il repond au probe. Retourne ok, raison.
+function M.preload(name)
+  name = M.normalize(name)
+
+  if not name or name == M.LOCAL then
+    return true, 'rien a rattacher'
+  end
+
+  if M.is_remote(name) then
+    if not remote_reachable() then
+      return false, 'injoignable (' .. env.VIBE_ADDR .. ':' .. env.VIBE_TLS_PORT .. ')'
+    end
+  elseif not local_mux_running() then
+    return false, 'mux local pas demarre'
+  end
+
+  return M.ensure_attached(name)
+end
+
 -- Rattache le domaine si besoin. Indispensable avant tout spawn sur un domaine
 -- mux, local comme distant : detache, il refuse le spawn. Seul le domaine
 -- integre est toujours pret. Pour le mux local, attach() demarre le serveur au
