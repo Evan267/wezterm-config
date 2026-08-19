@@ -537,3 +537,38 @@ controle avec `string.char(13)` plutot que `
   framebuffer/bureau qui transparait), glitch rendu visible par le compositing
   transparent (`window_background_opacity = 0.95`). Ne pas repasser a WebGpu sans
   revalider ce cas.
+- Fenetre maximisee au demarrage (`lua/options.lua`,
+  `M.apply_startup_maximize`) : maximisee et NON plein ecran, la barre des
+  taches Windows doit rester visible. Declencheur `update-status`, une fois par fenetre GUI. Les deux evenements
+  « evidents » sont inutilisables ici : `gui-startup` inhibe par sa seule
+  presence la creation de la fenetre par defaut (cf. section Domaines), et
+  `gui-attached` NE SE DECLENCHE PAS — c'est pourtant l'evenement documente pour
+  ce cas, mais il suppose un RATTACHEMENT a un domaine, et `default_domain` vise
+  le domaine integre. Meme point d'accroche, pour les memes raisons, que le
+  prechargement des domaines (`run_preload_once`).
+- **Un `wezterm.on` protege par une version dans `wezterm.GLOBAL` ne se
+  declenche jamais** (verifie le 2026-08-19 : le journal recevait « handler
+  enregistre » mais jamais « handler appele » ; enregistrement inconditionnel =
+  handler appele). La garde n'enregistre le handler qu'a la PREMIERE evaluation
+  de la config, alors que seuls les handlers de l'evaluation courante sont
+  vivants. Corollaire a verifier : le handler de bascule clair/sombre de
+  `lua/options.lua` porte exactement cette garde
+  (`DYNAMIC_COLOR_SCHEME_EVENT_VERSION`) et est donc probablement mort lui aussi.
+  Le modele qui marche est celui de `lua/workspaces.lua` : `wezterm.on` a chaque
+  evaluation du module, et l'etat anti-repetition dans `wezterm.GLOBAL` sous une
+  CLE SCALAIRE (`GLOBAL` ne conserve pas la mutation d'une table imbriquee).
+- Diagnostic des handlers : journaliser dans `~/.wezterm-workspaces.log`
+  (io.open, hors repo et hors `config_dir`), PAS via `wezterm.log_info` : le
+  filtre de log par defaut du GUI ne fait pas ressortir la cible `config`, et
+  les logs GUI (`~/.local/share/wezterm/wezterm-gui.exe-log-*.txt`) restent
+  muets. Ils servent en revanche a reperer les erreurs de config transitoires :
+  une ecriture en deux temps (`lua/*.lua` puis `wezterm.lua`) declenche un
+  rechargement au milieu, `Configuration Error ... attempt to call a nil value`,
+  et WezTerm garde alors la DERNIERE config valide — le test qui suit porte donc
+  sur l'ancien code.
+- `maximize()` de preference a `toggle_fullscreen()` : idempotent, donc
+  insensible aux exemplaires de handler qui s'empilent. `toggle_fullscreen` n'a
+  pas d'equivalent `set_fullscreen(true)`, il faudrait lire
+  `get_dimensions().is_full_screen` avant chaque appel. `ALT+ENTER` (binding
+  WezTerm par defaut, non redefini dans `lua/keys.lua`) reste la bascule plein
+  ecran manuelle.

@@ -56,6 +56,92 @@ function M.apply_dynamic_color_scheme()
     end)
 end
 
+-- FENETRE MAXIMISEE (et non plein ecran : la barre des taches Windows doit
+-- rester visible). Chaque fenetre GUI est maximisee UNE fois, la premiere fois
+-- qu'un `update-status` la presente — donc au demarrage, et aussi pour les
+-- fenetres ouvertes ensuite (workspace restaure). Une seule fois par fenetre :
+-- l'utilisateur qui demaximise n'est pas contrarie au tick suivant.
+--
+-- POURQUOI `update-status` et pas les evenements de demarrage :
+--   - `gui-startup` : sa seule presence inhibe la creation de la fenetre par
+--     defaut (cf. lua/domains.lua), il faudrait la spawner soi-meme, donc
+--     choisir un domaine au lancement — ce que cette config refuse.
+--   - `gui-attached` : NE SE DECLENCHE PAS ici (verifie le 2026-08-19, journal
+--     muet sur trois lancements). C'est l'evenement documente pour ce cas, mais
+--     il suppose que le GUI se RATTACHE a un domaine ; avec `default_domain`
+--     sur le domaine INTEGRE, il n'y a rien a rattacher.
+-- `update-status` est le meme point d'accroche que le prechargement des
+-- domaines (`run_preload_once`, lua/workspaces.lua), pour les memes raisons.
+--
+-- Journalisation dans `~/.wezterm-workspaces.log` (journal runtime deja utilise
+-- par lua/workspaces.lua) et non via `wezterm.log_info` : le filtre de log par
+-- defaut du GUI ne fait pas ressortir la cible `config`, ce qui rendait le
+-- diagnostic aveugle. Hors du repo ET hors de `config_dir` : y ecrire
+-- declencherait un rechargement de config a chaque ligne.
+local startup_log_path = wezterm.home_dir .. '/.wezterm-workspaces.log'
+
+local function startup_log(message)
+    local file = io.open(startup_log_path, 'a')
+
+    if not file then
+        return
+    end
+
+    file:write(os.date('%Y-%m-%d %H:%M:%S') .. ' maximize: ' .. tostring(message) .. '\n')
+    file:close()
+end
+
+function M.apply_startup_maximize()
+    -- PAS de garde-fou d'enregistrement ici, contrairement au theme
+    -- clair/sombre : un `wezterm.on` protege par une version dans
+    -- `wezterm.GLOBAL` n'est enregistre QU'A LA PREMIERE evaluation de la
+    -- config, et ce handler-la ne se declenche jamais (verifie le 2026-08-19 :
+    -- « handler enregistre » dans le journal, jamais « handler appele »). Le
+    -- handler `update-status` de lua/workspaces.lua, lui, s'enregistre a chaque
+    -- evaluation du module et fonctionne. On s'aligne dessus.
+    --
+    -- Le prix a payer : plusieurs exemplaires du handler coexistent apres
+    -- quelques rechargements, et chacun repart avec ses variables locales. L'etat
+    -- « cette fenetre a deja ete traitee » vit donc dans `wezterm.GLOBAL`, seul
+    -- endroit partage par tous, sous une CLE SCALAIRE par fenetre : `GLOBAL` ne
+    -- conserve pas la mutation d'une table imbriquee sans reaffectation.
+    wezterm.on('update-status', function(window)
+        -- Uniquement cote GUI : le wezterm-mux-server local lit ce meme fichier.
+        if not wezterm.gui or not window then
+            return
+        end
+
+        local ok, window_id = pcall(function()
+            return window:window_id()
+        end)
+
+        if not ok or window_id == nil then
+            return
+        end
+
+        local flag = 'startup_maximize_done_' .. tostring(window_id)
+
+        if wezterm.GLOBAL[flag] then
+            return
+        end
+
+        wezterm.GLOBAL[flag] = true
+
+        -- `maximize()` est idempotent, contrairement a `toggle_fullscreen()`
+        -- (pas de `set_fullscreen(true)` dans l'API) : un exemplaire de handler
+        -- en trop ne fait donc aucun degat.
+        local applied, err = pcall(function()
+            window:maximize()
+        end)
+
+        if applied then
+            startup_log('fenetre ' .. tostring(window_id) .. ' maximisee')
+        else
+            startup_log('fenetre ' .. tostring(window_id) .. ' ERREUR ' .. tostring(err))
+        end
+    end)
+end
+
 function M.apply(config)
     local color_scheme = current_color_scheme()
     wezterm.GLOBAL.dynamic_color_scheme = color_scheme
