@@ -455,23 +455,39 @@ Le module `lua/workspaces.lua` capture/restaure les workspaces dans
 
 ## Verification
 
-Avant de considerer une modification terminee :
+**`wezterm show-keys` NE VALIDE RIEN.** Quand la config utilisateur echoue a se
+charger, WezTerm retombe silencieusement sur sa configuration PAR DEFAUT :
+`show-keys` affiche alors les raccourcis d'usine, sans le moindre message, avec
+un code de sortie 0. Verifie le 2026-08-19 sur un module Lua a la syntaxe cassee
+— la commande repondait la meme chose qu'avec une config saine. Toute une soiree
+de « config OK » n'a rien prouve, et un fichier invalide est parti en commit.
 
-1. Verifier que `wezterm.lua` charge bien tous les modules necessaires.
-2. Lancer une verification de configuration WezTerm si disponible :
+Verifier une modification, dans cet ordre :
 
-   ```powershell
-   wezterm cli list
-   ```
-
-3. Redemarrer ou recharger WezTerm pour confirmer que les plugins se chargent correctement.
-4. Tester manuellement les raccourcis modifies.
-5. Controler le diff Git :
+1. **Le Lua se charge-t-il ?** C'est `ls-fonts` qui fait remonter l'erreur :
 
    ```powershell
-   git diff --check
-   git status --short
+   wezterm --config-file "$env:USERPROFILE\.config\wezterm\wezterm.lua" ls-fonts 2>&1 |
+     Select-String -Pattern 'runtime error|error loading|traceback'
    ```
+
+   Aucune ligne = le module se charge. Sinon la sortie donne fichier, ligne et
+   message.
+
+2. **Est-ce bien NOTRE config qui est active ?** Chercher un marqueur qui
+   n'existe pas dans la config par defaut — `EmitEvent` (nos `action_callback`)
+   ou `LEADER` — dans la sortie de `show-keys`. Absent = repli sur le defaut,
+   donc echec de chargement.
+
+3. Redemarrer ou recharger WezTerm et tester les raccourcis modifies.
+4. Controler le diff : `git diff --check`, `git status --short`.
+
+**Ne jamais ecrire d'antislash echappe depuis un outil d'edition automatique.**
+Deux modules ont ete casses le meme soir par un `\` reduit a `\` en cours de
+route (`'^%a:[/\]'` invalide, puis une chaine `'exit'` coupee en deux lignes).
+Preferer des formes qui n'en contiennent aucun : normaliser les separateurs avec
+`path:gsub(string.char(92), '/')` avant de filtrer, et composer les caracteres de
+controle avec `string.char(13)` plutot que ``.
 
 ## Points d'attention
 

@@ -1137,7 +1137,12 @@ local function is_bootstrap_window(mux_window)
   end
 
   -- `C:\Users\quelquun` et rien de plus profond, quelle que soit la casse.
-  if cwd:match('^%a:[/\]+[Uu][Ss][Ee][Rr][Ss][/\]+[^/\]+[/\]?$') then
+  -- Separateurs normalises AVANT le motif : ecrire un antislash dans un
+  -- motif Lua demande un echappement, source d'erreurs (une occurrence
+  -- mal echappee a casse le chargement du module le 2026-08-19).
+  local normalized = cwd:gsub(string.char(92), '/')
+
+  if normalized:match('^%a:/+[Uu][Ss][Ee][Rr][Ss]/+[^/]+/?$') then
     return pane
   end
 
@@ -1182,7 +1187,9 @@ local function evict_foreign_windows()
         -- laisser s'accumuler dans le workspace de passage.
         if bootstrap then
           pcall(function()
-            bootstrap:send_text('exit')
+            -- `string.char(13)` plutot qu'un retour chariot echappe : les
+            -- echappements ne survivent pas a tous les outils d'edition.
+            bootstrap:send_text('exit' .. string.char(13))
           end)
         end
       end
