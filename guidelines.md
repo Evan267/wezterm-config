@@ -169,6 +169,33 @@ Points de maintenance :
   La fenetre cible est desormais resolue par `workspace_mux_windows`, cote mux,
   ou le nom du workspace fait foi ; on attend la fenetre ET son pane d'accueil.
   Ne jamais reintroduire un test d'egalite de workspace sur `window:mux_window()`.
+- **UNE SEULE FENETRE OUVERTE, TOUJOURS.** Invariant du depot, pose le
+  2026-08-19 : rien dans cette config ne doit ouvrir une fenetre a cote. Le mode
+  « ouvrir en nouvelle fenetre » (`restore_workspace_in_new_window`, le mode
+  `new` de `restore_workspace`, le raccourci `ALT`+`SHIFT`+`o`) a donc ete
+  supprime en bloc. Un workspace s'ouvre la ou on est ; c'est WezTerm qui revele
+  la fenetre du workspace cible, une par workspace, jamais deux a la fois.
+  - Ce que WezTerm fait de son cote et qu'il ne faut pas confondre avec un bug :
+    **une fenetre mux <-> une fenetre OS**. A la bascule il DETRUIT la fenetre OS
+    du workspace quitte et en CREE une pour celui ou l'on arrive. Verifie le
+    2026-08-19 : une seule fenetre visible dans le systeme, et `windows=1` par
+    workspace cote mux, bascule apres bascule. Rien ne s'accumule ; c'est une
+    nouvelle fenetre OS, pas une fenetre en trop.
+  - **Limite connue, non resolue** : le `wezterm-mux-server` spawne sa propre
+    fenetre a son demarrage, dans le workspace `default`. Une fois le mux
+    rattache, `default` compte donc la fenetre du GUI (domaine integre) ET
+    celle-la. L'API Lua n'offre aucun moyen de fermer une fenetre mux : ni
+    `MuxWindow` ni `MuxTab` n'exposent de `close`/`kill`. Ne pas perdre de temps
+    a chercher, c'est verifie. On ne la voit qu'en etant sur `default`, qui n'est
+    pas un workspace de travail.
+- **Taille des splits en RATIO, jamais en absolu** (`apply_layout`) : la coupe
+  est calculee comme `second_size / total` et passee en fraction a
+  `pane:split`, donc relative a la fenetre DU MOMENT. Un workspace capture en 159
+  colonnes se rouvre aux memes proportions dans une fenetre plus petite. Ne pas
+  revenir a un nombre de cellules calcule sur les dimensions capturees. Le
+  `+ 0.005` compense le `floor` applique cote Rust
+  (`SplitSize::Percent((size * 100.).floor())`), qui faisait perdre un point de
+  pourcentage a chaque restauration sur certaines valeurs.
 - **Etat runtime HORS de `config_dir`** : le registre et le journal sont ecrits
   dans `~/.wezterm-workspaces.json` et `~/.wezterm-workspaces.log`, **jamais**
   dans `wezterm.config_dir`. WezTerm surveille son repertoire de config et

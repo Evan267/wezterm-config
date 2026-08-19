@@ -129,7 +129,7 @@ function M.apply(config)
       key = 'o',
       mods = 'ALT',
       action = w.action_callback(function(window, pane)
-	workspaces.choose_registered(window, pane, 'current')
+	workspaces.choose_registered(window, pane)
       end),
     },
     {
@@ -137,13 +137,6 @@ function M.apply(config)
       mods = 'ALT',
       action = w.action_callback(function(window, pane)
 	workspaces.restore_all_active(window, pane)
-      end),
-    },
-    {
-      key = 'O',
-      mods = 'ALT',
-      action = w.action_callback(function(window, pane)
-	workspaces.choose_registered(window, pane, 'new')
       end),
     },
     {

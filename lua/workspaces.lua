@@ -1220,10 +1220,19 @@ local function apply_layout(target_pane, node, workspace, tab_index)
       and (node.first_bounds.cols + node.second_bounds.cols)
       or (node.first_bounds.rows + node.second_bounds.rows)
     local second_size = node.direction == 'Right' and node.second_bounds.cols or node.second_bounds.rows
+    -- RATIO, jamais une taille absolue : la coupe doit suivre la fenetre du
+    -- moment, pas celle qui a ete capturee. Un workspace enregistre en 159
+    -- colonnes doit se rouvrir aux memes PROPORTIONS dans une fenetre plus
+    -- petite.
+    --
+    -- Le `+ 0.005` compense le `floor` que WezTerm applique cote Rust
+    -- (`SplitSize::Percent((size * 100.).floor())`) : sans lui, un pourcentage
+    -- entier dont la representation flottante tombe juste en dessous (0.29 ->
+    -- 28.999...) perdait un point a chaque restauration.
     local percent = math.max(5, math.min(95, math.floor((second_size / total) * 100 + 0.5)))
     local split_args = {
       direction = node.direction,
-      size = percent / 100,
+      size = (percent + 0.005) / 100,
     }
     local spawn = layout_pane_spawn(first_leaf_pane(node.second), workspace)
 
@@ -1255,68 +1264,6 @@ local function apply_layout(target_pane, node, workspace, tab_index)
   end
 end
 
-local function restore_workspace_in_new_window(window, pane, workspace)
-  local first_tab = workspace.tabs[1]
-  local first_layout = build_tab_layout(first_tab)
-  -- `workspace` est indispensable : sans lui, mux.spawn_window place la fenetre
-  -- dans le workspace ACTIF, pas dans celui qu'on restaure. Le workspace cible
-  -- restait alors une coquille vide pendant que son contenu s'ouvrait ailleurs.
-  local ok, first_mux_tab, first_mux_pane, mux_window = pcall(function()
-    return wezterm.mux.spawn_window(merge_spawn_options({
-      workspace = workspace.name,
-      domain = domains.spawn_domain(workspace.domain),
-      position = { origin = 'ActiveScreen', x = 80, y = 80 },
-    }, first_layout_spawn(workspace, 1, first_layout)))
-  end)
-
-  if not ok or not mux_window then
-    append_debug('restore spawn_window failed name=' .. tostring(workspace.name) .. ' err=' .. tostring(first_mux_pane))
-    notify_error(window, 'Impossible de restaurer le workspace: ' .. workspace.name)
-    return false
-  end
-
-  append_debug('restore spawn_window ok name=' .. tostring(workspace.name))
-  set_tab_title(first_mux_tab, first_tab.title)
-
-  local layout_ok, layout_err = pcall(function()
-    apply_layout(first_mux_pane, first_layout, workspace, 1)
-  end)
-
-  if not layout_ok then
-    notify_error(window, 'Erreur layout: ' .. tostring(layout_err))
-  end
-
-  for index = 2, #workspace.tabs do
-    local tab_snapshot = workspace.tabs[index]
-    local tab_layout = build_tab_layout(tab_snapshot)
-    local new_tab, new_pane = mux_window:spawn_tab(
-      merge_spawn_options({}, first_layout_spawn(workspace, index, tab_layout))
-    )
-
-    set_tab_title(new_tab, tab_snapshot.title)
-
-    pcall(function()
-      apply_layout(new_pane, tab_layout, workspace, index)
-    end)
-  end
-
-  focus_mux_window_soon(mux_window)
-
-  return true
-end
-
--- Une reconstruction est ASYNCHRONE : le SwitchToWorkspace cree la fenetre, et
--- le rejeu de la disposition n'arrive qu'ensuite. Pendant ces quelques centaines
--- de ms le workspace parait encore vide, donc une deuxieme frappe (ALT+fleches
--- enchainees, selecteur) en relance une par-dessus — d'ou les fenetres qui
--- s'ouvrent « de partout ». Constate le 2026-08-19 : `test-restore` reconstruit
--- a 21:01:37 puis a 21:01:39.
---
--- Le drapeau vit dans `wezterm.GLOBAL` (il doit survivre a un rechargement de
--- config, frequent sur ce depot) sous une cle PLATE par workspace : muter une
--- table imbriquee de GLOBAL n'est pas fiable. Il porte une echeance, pour qu'une
--- reconstruction morte ne bloque pas le workspace pour toujours.
-local BUILD_FLIGHT_SECONDS = 10
 
 local function build_flight_key(name)
   return 'workspace_build_in_flight_' .. tostring(name)
@@ -1435,10 +1382,9 @@ local function restore_workspace_in_current_window(window, pane, workspace)
   return true
 end
 
-local function restore_workspace(window, pane, workspace, mode)
-  mode = mode or 'current'
+local function restore_workspace(window, pane, workspace)
   append_debug('restore start name=' .. tostring(workspace.name)
-    .. ' mode=' .. tostring(mode) .. ' domain=' .. tostring(workspace.domain))
+    .. ' domain=' .. tostring(workspace.domain))
 
   -- Reconstruction deja en vol : on se contente de basculer dessus. En relancer
   -- une par-dessus creerait un deuxieme jeu de fenetres.
@@ -1462,31 +1408,9 @@ local function restore_workspace(window, pane, workspace, mode)
     return
   end
 
-  if mode == 'new' then
-    if type(workspace.tabs) == 'table' and #workspace.tabs > 0 then
-      if restore_workspace_in_new_window(window, pane, workspace) then
-        append_debug('restore done new window name=' .. tostring(workspace.name))
-      end
-
-      return
-    end
-
-    local ok, err = pcall(function()
-      wezterm.mux.spawn_window(merge_spawn_options({
-        workspace = workspace.name,
-      }, workspace_domain_spawn(workspace)))
-    end)
-
-    if ok then
-      append_debug('restore legacy new window name=' .. tostring(workspace.name))
-    else
-      append_debug('restore legacy new window failed: ' .. tostring(err))
-      notify_error(window, 'Impossible d ouvrir une nouvelle fenetre: ' .. workspace.name)
-    end
-
-    return
-  end
-
+  -- PAS de mode « nouvelle fenetre ». Invariant du depot : une seule fenetre
+  -- ouverte a la fois. Un workspace s'ouvre la ou on est — WezTerm y revele la
+  -- fenetre du workspace cible — jamais a cote.
   if workspace_is_live(workspace.name) then
     append_debug('restore live switch name=' .. tostring(workspace.name))
 
@@ -1678,14 +1602,10 @@ local function workspace_choice_label(workspace, suffix)
   return workspace.name .. '  [' .. domains.label(workspace.domain) .. ']' .. (suffix or '')
 end
 
-function M.choose_registered(window, pane, mode)
+function M.choose_registered(window, pane)
   local registry = load_registry()
   local choices = {}
-  local title = 'Ouvrir un workspace ici'
-
-  if mode == 'new' then
-    title = 'Ouvrir un workspace en nouvelle fenetre'
-  end
+  local title = 'Ouvrir un workspace'
 
   for _, workspace in ipairs(list_workspaces(registry, 'active')) do
     table.insert(choices, {
@@ -1708,11 +1628,11 @@ function M.choose_registered(window, pane, mode)
         local name = id or label
 
         if name then
-          append_debug('selector selected name=' .. tostring(name) .. ' mode=' .. tostring(mode))
+          append_debug('selector selected name=' .. tostring(name))
           local selected = find_workspace(load_registry(), name)
 
           if selected then
-            restore_workspace(win, p, selected, mode)
+            restore_workspace(win, p, selected)
           else
             append_debug('selector missing workspace name=' .. tostring(name))
             notify_error(win, 'Workspace introuvable: ' .. tostring(name))
@@ -1910,7 +1830,7 @@ function M.restore_all_active(window, pane)
         .. ' domain=' .. tostring(workspace.domain))
       unreachable = unreachable + 1
     else
-      restore_workspace(window, pane, workspace, 'new')
+      restore_workspace(window, pane, workspace)
       restored = restored + 1
     end
   end
