@@ -1167,7 +1167,30 @@ local function evict_foreign_windows()
       return mux_window:get_workspace()
     end)
 
-    if named and host_workspace ~= scratch_workspace then
+    -- Workspace de PASSAGE : c'est la qu'atterrissent les fenetres d'amorcage
+    -- importees au rattachement d'un domaine, une par serveur — donc « un
+    -- wezterm-gui par connexion » a l'ouverture (rapporte le 2026-08-19). On les
+    -- fait sortir.
+    --
+    -- La fenetre du GUI lui-meme y est AUSSI, et elle a la meme forme (un
+    -- onglet, un pane, au HOME). Ce qui les separe est le DOMAINE : celle du GUI
+    -- tourne sur le domaine integre, les intruses sur un mux. Ne jamais relacher
+    -- ce test, c'est lui qui protege la fenetre de l'utilisateur.
+    if named and host_workspace == scratch_workspace then
+      local actual = window_domain(mux_window)
+
+      if actual and actual ~= domains.LOCAL then
+        local bootstrap = is_bootstrap_window(mux_window)
+
+        if bootstrap then
+          append_debug('fenetre d amorcage fermee dans ' .. tostring(host_workspace)
+            .. ' (domaine ' .. tostring(actual) .. ')')
+          pcall(function()
+            bootstrap:send_text('exit' .. string.char(13))
+          end)
+        end
+      end
+    elseif named then
       local entry = find_workspace(registry, host_workspace)
       local expected = entry and domains.normalize(entry.domain)
       local actual = window_domain(mux_window)
@@ -1991,30 +2014,34 @@ end
 --
 -- `update-status` est l'evenement dont on est sur qu'il tire, des le premier
 -- rendu et sans rien pour l'inhiber.
-local HANDLERS_VERSION = 1
-
-function M.start_auto_save()
-  -- UNIQUEMENT dans le process GUI. Le wezterm-mux-server local lit ce meme
-  -- fichier de config : sans ce garde-fou il tiendrait sa propre boucle sur le
-  -- meme registre, avec une vision partielle. `wezterm.gui` n'existe que cote
-  -- GUI (meme test que lua/options.lua pour le theme).
+-- Auto-sauvegarde, prechargement : branches sur `update-status`, AU NIVEAU DU
+-- MODULE, comme lua/notify.lua — et sans garde-fou « une fois par process ».
+--
+-- WezTerm reconstruit sa table de handlers a chaque evaluation de la config, et
+-- il y en a une a chaque rechargement. Un garde-fou dans `wezterm.GLOBAL`, lui,
+-- survit aux rechargements : il bloquait donc tout re-enregistrement APRES que
+-- WezTerm eut vide la table. Le handler etait enregistre une fois, puis perdu au
+-- premier rechargement et jamais repose — l'auto-save et le prechargement ne
+-- tournaient plus, sans le moindre message. Constate le 2026-08-19 : la ligne
+-- « handlers enregistres » au journal, et aucune trace de declenchement ensuite.
+--
+-- Re-enregistrer a chaque evaluation est le comportement CORRECT ici, pas une
+-- fuite : la table repart vide a chaque fois.
+wezterm.on('update-status', function()
+  -- Uniquement cote GUI. Le wezterm-mux-server local lit ce meme fichier de
+  -- config ; sans ce test il tiendrait sa propre boucle de sauvegarde sur le
+  -- meme registre, avec une vision partielle.
   if not wezterm.gui then
     return
   end
 
-  -- Un `wezterm.on` par rechargement de config EMPILERAIT les handlers (meme
-  -- garde-fou que le theme dans lua/options.lua) : on n'enregistre qu'une fois
-  -- par process.
-  if wezterm.GLOBAL.workspace_handlers_version == HANDLERS_VERSION then
-    return
-  end
+  arm_auto_save()
+  run_preload_once()
+end)
 
-  wezterm.GLOBAL.workspace_handlers_version = HANDLERS_VERSION
-
-  wezterm.on('update-status', function()
-    arm_auto_save()
-    run_preload_once()
-  end)
+-- Conservee : `wezterm.lua` l'appelle. Le branchement se fait desormais a
+-- l'evaluation du module, cette fonction n'a plus rien a faire.
+function M.start_auto_save()
 end
 
 return M
