@@ -25,6 +25,10 @@ local debug_path = wezterm.home_dir .. '/.wezterm-workspaces.log'
 -- Ancien emplacement, relu UNE fois pour reprendre le registre existant.
 local legacy_registry_path = wezterm.config_dir .. '/workspaces.json'
 local snapshot_version = 1
+-- Workspace de PASSAGE de WezTerm : celui qu'on obtient sans rien demander. Ce
+-- n'est pas un workspace de travail, et c'est la qu'on relegue les fenetres qui
+-- n'ont rien a faire ailleurs (cf. evict_foreign_windows).
+local scratch_workspace = 'default'
 
 local notify = notifications.info
 local notify_error = notifications.error
@@ -271,7 +275,7 @@ local function workspace_name(window)
     return name
   end
 
-  return 'default'
+  return scratch_workspace
 end
 
 local function canonical_workspace_name(name)
@@ -1047,6 +1051,86 @@ local function arm_auto_save()
 end
 
 -- ---------------------------------------------------------------------------
+-- Expulsion des fenetres INTRUSES
+--
+-- Un `wezterm-mux-server` spawne une fenetre pour lui-meme a son demarrage (ce
+-- n'est pas evitable : un handler `mux-startup` ne l'inhibe pas, contrairement a
+-- `gui-startup`). Au rattachement du domaine, WezTerm importe les fenetres du
+-- serveur — celle-la comprise — et la place dans le workspace ACTIF a cet
+-- instant. Elle atterrit donc en plein milieu du workspace qu'on est en train
+-- d'ouvrir, une fois par domaine et par session. C'est la « fenetre qui s'ouvre
+-- a la premiere connexion » rapportee le 2026-08-19, et le registre du jour en
+-- garde deux traces : un pane `vibe` (cwd HOME de vibe) dans `chaud-devant`, qui
+-- est un workspace localmux, et un pwsh `localmux` au HOME dans `modif-order`,
+-- qui est un workspace vibe.
+--
+-- Le critere n'est PAS heuristique : une fenetre dont les panes ne tournent pas
+-- sur le domaine du workspace n'a rien a y faire. Un workspace legitime a toutes
+-- ses fenetres sur son propre domaine, par construction.
+--
+-- On DEPLACE, on ne ferme pas : `MuxWindow` n'expose de toute facon ni `close`
+-- ni `kill`. La fenetre part dans le workspace de passage, ou elle ne gene
+-- personne et reste accessible.
+local function window_domain(mux_window)
+  local ok, pane = pcall(function()
+    return mux_window:active_pane()
+  end)
+
+  if not ok or not pane then
+    return nil
+  end
+
+  return domains.pane_domain(pane)
+end
+
+local function evict_foreign_windows()
+  if not (wezterm.mux and wezterm.mux.all_windows) then
+    return
+  end
+
+  local listed, mux_windows = pcall(wezterm.mux.all_windows)
+
+  if not listed or type(mux_windows) ~= 'table' then
+    return
+  end
+
+  local registry = load_registry()
+
+  for _, mux_window in ipairs(mux_windows) do
+    local named, host_workspace = pcall(function()
+      return mux_window:get_workspace()
+    end)
+
+    if named and host_workspace ~= scratch_workspace then
+      local entry = find_workspace(registry, host_workspace)
+      local expected = entry and domains.normalize(entry.domain)
+      local actual = window_domain(mux_window)
+
+      if expected and actual and expected ~= actual then
+        local moved = pcall(function()
+          mux_window:set_workspace(scratch_workspace)
+        end)
+
+        append_debug('fenetre intruse ecartee de ' .. tostring(host_workspace)
+          .. ' (domaine ' .. tostring(actual) .. ' au lieu de ' .. tostring(expected)
+          .. ') ok=' .. tostring(moved))
+      end
+    end
+  end
+end
+
+-- L'import des fenetres distantes est asynchrone : on repasse peu apres.
+local function evict_foreign_windows_soon()
+  pcall(evict_foreign_windows)
+
+  if wezterm.time and wezterm.time.call_after then
+    wezterm.time.call_after(1.5, function()
+      pcall(evict_foreign_windows)
+    end)
+  end
+end
+
+-- ---------------------------------------------------------------------------
 -- Prechargement des connexions, une fois par process
 --
 -- Rattache les domaines dont les workspaces ACTIFS ont besoin, pour que leurs
@@ -1071,6 +1155,10 @@ local function preload_domains()
       local ok, reason = domains.preload(domain)
       append_debug('prechargement domaine=' .. domain
         .. ' ok=' .. tostring(ok) .. ' (' .. tostring(reason) .. ')')
+
+      if ok then
+        evict_foreign_windows_soon()
+      end
     end
   end
 end
@@ -1348,6 +1436,10 @@ local function restore_workspace(window, pane, workspace)
     notify_error(window, 'Domaine ' .. domains.label(workspace.domain) .. ' injoignable: ' .. workspace.name)
     return
   end
+
+  -- Le rattachement vient peut-etre d'importer la fenetre d'amorcage du serveur
+  -- dans le workspace courant : on l'ecarte avant de continuer.
+  evict_foreign_windows_soon()
 
   -- PAS de mode « nouvelle fenetre ». Invariant du depot : une seule fenetre
   -- ouverte a la fois. Un workspace s'ouvre la ou on est — WezTerm y revele la

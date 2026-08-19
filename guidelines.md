@@ -169,6 +169,24 @@ Points de maintenance :
   La fenetre cible est desormais resolue par `workspace_mux_windows`, cote mux,
   ou le nom du workspace fait foi ; on attend la fenetre ET son pane d'accueil.
   Ne jamais reintroduire un test d'egalite de workspace sur `window:mux_window()`.
+- **Expulser les fenetres INTRUSES apres un rattachement** (`evict_foreign_windows`).
+  Un `wezterm-mux-server` spawne une fenetre pour lui-meme a son demarrage — ce
+  n'est pas evitable, un handler `mux-startup` ne l'inhibe pas contrairement a
+  `gui-startup`. Au rattachement du domaine, WezTerm importe les fenetres du
+  serveur, celle-la comprise, et la place dans le workspace **ACTIF a cet
+  instant** : elle atterrit donc au milieu du workspace qu'on est en train
+  d'ouvrir, une fois par domaine et par session. C'est la « fenetre qui s'ouvre a
+  la premiere connexion, puis plus rien » rapportee le 2026-08-19 ; le registre
+  du jour en garde deux traces : un pane `vibe` dans `chaud-devant` (workspace
+  localmux) et un pwsh `localmux` dans `modif-order` (workspace vibe).
+  - Le critere n'est **pas** heuristique : une fenetre dont les panes ne tournent
+    pas sur le domaine du workspace n'a rien a y faire. Un workspace legitime a
+    toutes ses fenetres sur son propre domaine, par construction. Pas de test sur
+    le cwd, le titre ou le nombre de panes — ils auraient fini par se tromper.
+  - On DEPLACE vers le workspace de passage, on ne ferme pas : `MuxWindow`
+    n'expose ni `close` ni `kill` (verifie dans le binaire ; `set_workspace`, si).
+    La fenetre reste accessible, elle ne gene simplement plus.
+  - Passe rejouee 1,5 s plus tard : l'import des fenetres distantes est asynchrone.
 - **Construire la fenetre AVANT de basculer dessus** (`restore_workspace_in_current_window`).
   `SwitchToWorkspace { spawn = ... }` cree la fenetre EN DIFFERE : entre la
   bascule et son arrivee, le GUI a deja detruit celle du workspace quitte et n'a
