@@ -10,7 +10,8 @@ Structure actuelle :
 - `lua/env.lua` : chargement des variables depuis `.env` (avec defauts internes).
 - `lua/options.lua` : options visuelles et comportementales de base.
 - `lua/domains.lua` : domaines local/distant (`unix_domains`, `tls_clients`,
-  `default_domain`, selecteur de demarrage, bascule `ALT+SHIFT+D`).
+  `default_domain`, selecteur de domaine a la creation d'un workspace, bascule
+  `ALT+SHIFT+D`).
 - `lua/notify.lua` : notifications ephemeres dans le statut droit, partagees par
   `lua/workspaces.lua` et `lua/domains.lua`.
 - `lua/status.lua` : barre native WezTerm et titres d'onglets.
@@ -85,15 +86,20 @@ proposes** :
 
 Points de maintenance :
 
-- **Ou vivent les domaines** : `unix_domains`, `tls_clients`, `default_domain`
-  et l'evenement `gui-startup` sont dans `lua/domains.lua`, plus dans
-  `lua/options.lua`. Ce dernier ne garde que les options
+- **Ou vivent les domaines** : `unix_domains`, `tls_clients` et `default_domain`
+  sont dans `lua/domains.lua`, plus dans `lua/options.lua`. Ce dernier ne garde que les options
   visuelles/comportementales.
-- **`default_domain = localmux`, pas `local`** : dans le domaine integre, les
-  panes vivent dans le process GUI et meurent avec la fenetre — une reprise n'y
-  est qu'un **rejeu** de `workspaces.json` (cwd + `last_command`), pas un
-  rattachement. Le mux local rend les panes locaux reellement persistants, comme
-  ceux de vibe. Sous Windows le transport est un socket
+- **`default_domain = local` (le domaine INTEGRE)** : au lancement, WezTerm ne
+  sollicite aucun mux-server — pas de socket a joindre, pas de serveur a
+  demarrer, pas de session a refleter. C'est ce qui rend le demarrage insensible
+  a l'etat des serveurs (cf. le point suivant : WezTerm se TERMINE si son domaine
+  par defaut est injoignable, et c'etait le risque permanent de
+  `default_domain = localmux`). Contrepartie assumee : les panes du workspace de
+  passage `default` vivent dans le process GUI et meurent avec la fenetre.
+  Un mux n'entre en jeu qu'a la CREATION d'un workspace (`ALT+n` demande lequel)
+  ou a l'ouverture d'un workspace enregistre, qui porte son domaine.
+  `unix_domains` n'a pas `connect_automatically` : le mux local ne demarre qu'au
+  premier spawn qui le vise. Sous Windows le transport est un socket
   (`~/.local/share/wezterm/sock`) ; `socket_path` n'a pas besoin d'etre
   configure, et WezTerm demarre le serveur a la demande
   (`wezterm-mux-server --daemonize`).
@@ -121,10 +127,10 @@ Points de maintenance :
   n'a pas le meme `PANEID` dans `wezterm cli list` (vue GUI) et dans
   `wezterm cli --prefer-mux list` (vue serveur). Ne pas conclure « ce n'est pas
   le meme pane » sur cette base en debug ; comparer plutot le cwd ou le titre.
-- **Le domaine integre `local` reste le repli** : c'est le seul qui ne peut
-  jamais etre injoignable. Il n'est plus propose dans le selecteur mais sert de
-  repli de `ensure_session_window` et reste restaurable (anciens snapshots de
-  `workspaces.json`). Ne pas le supprimer.
+- **Le domaine integre `local` est celui du DEMARRAGE** : c'est le seul qui ne
+  peut jamais etre injoignable. Il n'est pas propose dans le selecteur de
+  domaine : un workspace NOMME doit survivre a la fermeture, donc mux local ou
+  vibe. Ne pas le supprimer.
 - **WezTerm se TERMINE si le domaine par defaut est injoignable** (verifie :
   `failed to connect to Socket(...); terminating` dans
   `~/.local/share/wezterm/wezterm-gui.exe-log-*.txt`). Le rattachement a lieu
@@ -132,34 +138,37 @@ Points de maintenance :
   doc reprochait a `default_domain = vibe`. Assume pour le mux local (meme
   machine, demarre a la demande), inacceptable pour vibe : ne jamais retablir
   `default_domain = vibe` + `default_gui_startup_args = { 'connect', vibe }`.
-  Porte de sortie si le mux local casse : `WEZTERM_LOCAL_MUX=0` dans
-  l'environnement (`M.local_mux_enabled`). Un `--config default_domain=...` en
-  ligne de commande **ne marche pas**, `M.apply` le reecrit.
-- **Sequence de demarrage** (`gui-startup` + `ensure_session_window`) — a ne pas
-  « ameliorer » sans relire ceci :
-  - `gui-startup` NE SPAWNE RIEN. C'est le rattachement du domaine par defaut
-    qui ouvre la ou les fenetres : celles du mux local, telles que l'utilisateur
-    les avait laissees. Toute fenetre creee ici fait DOUBLON — elle s'ouvre puis
-    se referme sous les yeux de l'utilisateur, et si elle part dans le mux elle y
-    reste (4 fenetres au 4e demarrage, bug constate).
-  - Contre-verite a ne pas reintroduire : « gui-startup doit creer une fenetre
-    sinon WezTerm quitte ». Verifie, c'est faux. Le quit observe venait du
-    domaine par defaut **injoignable** (`failed to connect ... terminating`),
-    pas de l'absence de spawn.
-  - `ensure_session_window` ne fait que verifier, apres coup, qu'une fenetre est
-    bien apparue (le rattachement est asynchrone). Sinon — mux joignable mais
-    sans aucune fenetre — il en ouvre une DANS LE MUX, avec repli sur le domaine
-    integre. En pratique WezTerm s'en charge deja tout seul dans ce cas ; le
-    filet ne coute rien et evite de travailler sans persistance sans le savoir.
-  - Le selecteur « Ou travailler ? » n'est arme qu'une fois la fenetre de session
-    presente : pose dans une fenetre transitoire, il disparaitrait avec elle. Il
-    s'affiche via `update-status` (seul endroit qui fournit une **GuiWindow**),
-    avec un drapeau one-shot dans `wezterm.GLOBAL` pour ne pas reposer la
-    question a chaque reload de config.
-  - **Ne plus jamais fermer de fenetre automatiquement** (l'ancien
-    `close_bootstrap_window` a ete supprime) : depuis que le mux local est le
-    domaine par defaut, la fenetre d'ou part le selecteur est une session
-    VIVANTE. La fermer tuerait de vrais panes.
+  Un `--config default_domain=...` en ligne de commande **ne marche pas**,
+  `M.apply` le reecrit.
+- **AUCUN handler `gui-startup`, et c'est delibere** : sa seule presence inhibe
+  la creation de la fenetre par defaut de WezTerm, qu'il faudrait alors spawner
+  soi-meme — et toute fenetre spawnee la faisait DOUBLON avec celles du
+  rattachement (4 fenetres au 4e demarrage, bug constate). Sans handler, WezTerm
+  ouvre sa fenetre sur `default_domain`, donc sur le domaine integre. Contre-
+  verite a ne pas reintroduire : « gui-startup doit creer une fenetre sinon
+  WezTerm quitte » — verifie, c'est faux ; le quit observe venait du domaine par
+  defaut **injoignable**.
+- **Pas de selecteur au demarrage.** Le choix du serveur est une question de
+  CREATION de workspace, pas de lancement du terminal (demande utilisateur du
+  2026-08-19). L'ancienne sequence `gui-startup` + `ensure_session_window` +
+  selecteur « Ou travailler ? » + `adopt_domain_session` a ete supprimee en bloc :
+  elle existait pour rattraper l'asynchronisme du rattachement au demarrage, qui
+  n'a plus lieu.
+- **Un objet `GuiWindow` de callback est FIGE sur sa fenetre mux**
+  (`restore_layout_when_ready`, section Workspaces). Le `window` passe au
+  callback d'un raccourci reste lie a la fenetre MUX qu'il avait au moment de la
+  frappe : apres un `SwitchToWorkspace` il continue de rendre l'ANCIEN workspace,
+  indefiniment tant que cette fenetre vit ailleurs dans le mux. L'attente du
+  layout comparait justement `window:mux_window():get_workspace()` au nom cible
+  et abandonnait donc TOUJOURS des lors qu'on venait d'un autre workspace —
+  c'est-a-dire dans le cas normal. Trace le 2026-08-19, matin et soir :
+  « restore layout gave up workspace=modif-order » 3 s apres avoir bascule sur
+  `chaud-devant`, alors que le spawn avait bien cree sa fenetre. Cout reel : la
+  disposition n'etait JAMAIS rejouee, il ne restait que la fenetre a un pane
+  creee par le spawn, et l'auto-save finissait par enteriner cet etat ampute.
+  La fenetre cible est desormais resolue par `workspace_mux_windows`, cote mux,
+  ou le nom du workspace fait foi ; on attend la fenetre ET son pane d'accueil.
+  Ne jamais reintroduire un test d'egalite de workspace sur `window:mux_window()`.
 - **Rattachement** (`ensure_attached`) : un domaine mux **detache refuse tout
   spawn**. Toute restauration ou creation sur un domaine mux — `localmux`
   compris, seul `local` est exempt — doit appeler `domains.ensure_attached`

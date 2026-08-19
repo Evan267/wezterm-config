@@ -1169,17 +1169,12 @@ local function restore_workspace_in_new_window(window, pane, workspace)
   return true
 end
 
-local function restore_layout_in_current_window(window, workspace)
+-- `mux_window` est fournie par l'appelant, resolue COTE MUX (cf.
+-- restore_layout_when_ready) : ne jamais la redemander a `window:mux_window()`.
+local function restore_layout_in_window(window, mux_window, workspace)
   local first_tab = workspace.tabs[1]
   local first_layout = build_tab_layout(first_tab)
   local ok, err = pcall(function()
-    local mux_window = window:mux_window()
-
-    if mux_window:get_workspace() ~= workspace.name then
-      append_debug('restore current window skipped wrong workspace=' .. tostring(mux_window:get_workspace()))
-      return
-    end
-
     local first_mux_pane = mux_window:active_pane()
     set_tab_title(mux_window:active_tab(), first_tab.title)
 
@@ -1203,23 +1198,51 @@ local function restore_layout_in_current_window(window, workspace)
   end
 end
 
--- Le SwitchToWorkspace n'est pas synchrone: la fenetre peut encore reporter
--- l'ancien workspace pendant quelques dizaines de ms. On re-essaie jusqu'a ce que
--- le workspace cible soit actif, au lieu de skipper le layout (ancien bug).
+-- Le SwitchToWorkspace n'est pas synchrone : la fenetre mux du workspace cible
+-- n'existe pas encore au retour de `perform_action`. On l'attend, puis on y
+-- rejoue la disposition.
+--
+-- ON NE DEMANDE JAMAIS SON WORKSPACE A `window:mux_window()`. L'objet GuiWindow
+-- passe au callback d'un raccourci reste lie a la fenetre MUX qu'il avait au
+-- moment de la frappe : apres un SwitchToWorkspace il continue de designer
+-- l'ancienne fenetre, donc l'ANCIEN workspace — indefiniment, tant que cette
+-- fenetre vit encore ailleurs dans le mux. Le test d'egalite echouait donc
+-- toujours des lors qu'on venait d'un AUTRE workspace, c'est-a-dire dans le cas
+-- normal (ALT+fleches, selecteur). Trace le 2026-08-19 a l'identique le matin et
+-- le soir : « restore layout gave up workspace=modif-order » 3 s apres avoir
+-- bascule sur chaud-devant, alors que le spawn avait bien cree sa fenetre.
+--
+-- Cout reel du bug : la disposition n'etait JAMAIS rejouee. Il ne restait que la
+-- fenetre a un pane creee par le `spawn` du SwitchToWorkspace, et l'auto-save
+-- finissait par enteriner cet etat ampute a la place du bon enregistrement.
+--
+-- La cible est donc resolue par `workspace_mux_windows`, cote mux, ou le nom du
+-- workspace fait foi. On attend la fenetre ET son pane d'accueil : la fenetre
+-- apparait avant que son spawn n'ait produit son pane.
 local function restore_layout_when_ready(window, workspace, attempts)
   attempts = attempts or 0
 
-  local ok, current = pcall(function()
-    return window:mux_window():get_workspace()
-  end)
+  local host = nil
 
-  if ok and current == workspace.name then
-    restore_layout_in_current_window(window, workspace)
+  for _, mux_window in ipairs(workspace_mux_windows(workspace.name)) do
+    local ok, host_pane = pcall(function()
+      return mux_window:active_pane()
+    end)
+
+    if ok and host_pane ~= nil then
+      host = mux_window
+      break
+    end
+  end
+
+  if host then
+    restore_layout_in_window(window, host, workspace)
     return
   end
 
   if attempts >= 30 then
-    append_debug('restore layout gave up workspace=' .. tostring(current))
+    append_debug('restore layout gave up (aucune fenetre d accueil) name='
+      .. tostring(workspace.name))
     return
   end
 
@@ -1227,8 +1250,6 @@ local function restore_layout_when_ready(window, workspace, attempts)
     wezterm.time.call_after(0.1, function()
       restore_layout_when_ready(window, workspace, attempts + 1)
     end)
-  else
-    restore_layout_in_current_window(window, workspace)
   end
 end
 
