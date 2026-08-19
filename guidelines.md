@@ -169,6 +169,20 @@ Points de maintenance :
   La fenetre cible est desormais resolue par `workspace_mux_windows`, cote mux,
   ou le nom du workspace fait foi ; on attend la fenetre ET son pane d'accueil.
   Ne jamais reintroduire un test d'egalite de workspace sur `window:mux_window()`.
+- **Construire la fenetre AVANT de basculer dessus** (`restore_workspace_in_current_window`).
+  `SwitchToWorkspace { spawn = ... }` cree la fenetre EN DIFFERE : entre la
+  bascule et son arrivee, le GUI a deja detruit celle du workspace quitte et n'a
+  plus rien a afficher — il se retrouve **sans aucune fenetre**, process vivant
+  mais invisible. Mesure le 2026-08-19 a 21:28:45 par echantillonnage des
+  fenetres du systeme : `fenetres=0` avec deux process GUI en vie, suivi d'un
+  relancement manuel (3e process). C'est l'origine des « instances qui
+  s'accumulent » : l'utilisateur relance parce que WezTerm a disparu de l'ecran.
+  `wezterm.mux.spawn_window` est SYNCHRONE — il rend fenetre, onglet et pane
+  immediatement. On pose donc toute la disposition avant que le GUI ne bascule,
+  et il trouve une fenetre prete au lieu du vide. Corollaire : plus rien a
+  attendre ensuite (le waiter `restore_layout_when_ready` et le garde-fou
+  « reconstruction en vol » ont ete supprimes avec lui — ils ne compensaient que
+  cet asynchronisme). Ne pas revenir a un `spawn` porte par le SwitchToWorkspace.
 - **UNE SEULE FENETRE OUVERTE, TOUJOURS.** Invariant du depot, pose le
   2026-08-19 : rien dans cette config ne doit ouvrir une fenetre a cote. Le mode
   « ouvrir en nouvelle fenetre » (`restore_workspace_in_new_window`, le mode

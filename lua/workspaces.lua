@@ -1265,18 +1265,9 @@ local function apply_layout(target_pane, node, workspace, tab_index)
 end
 
 
-local function build_flight_key(name)
-  return 'workspace_build_in_flight_' .. tostring(name)
-end
-
-local function build_in_flight(name)
-  local deadline = wezterm.GLOBAL[build_flight_key(name)]
-
-  return type(deadline) == 'number' and os.time() < deadline
-end
-
--- `mux_window` est fournie par l'appelant, resolue COTE MUX (cf.
--- restore_layout_when_ready) : ne jamais la redemander a `window:mux_window()`.
+-- `mux_window` est fournie par l'appelant, qui vient de la creer : ne JAMAIS la
+-- redemander a `window:mux_window()`, qui reste fige sur la fenetre mux d'avant
+-- la bascule (cf. l'entree correspondante des guidelines).
 local function restore_layout_in_window(window, mux_window, workspace)
   local first_tab = workspace.tabs[1]
   local first_layout = build_tab_layout(first_tab)
@@ -1304,80 +1295,41 @@ local function restore_layout_in_window(window, mux_window, workspace)
   end
 end
 
--- Le SwitchToWorkspace n'est pas synchrone : la fenetre mux du workspace cible
--- n'existe pas encore au retour de `perform_action`. On l'attend, puis on y
--- rejoue la disposition.
+-- Construit la fenetre du workspace PUIS bascule dessus. L'ordre est le fond du
+-- probleme, pas un detail :
 --
--- ON NE DEMANDE JAMAIS SON WORKSPACE A `window:mux_window()`. L'objet GuiWindow
--- passe au callback d'un raccourci reste lie a la fenetre MUX qu'il avait au
--- moment de la frappe : apres un SwitchToWorkspace il continue de designer
--- l'ancienne fenetre, donc l'ANCIEN workspace — indefiniment, tant que cette
--- fenetre vit encore ailleurs dans le mux. Le test d'egalite echouait donc
--- toujours des lors qu'on venait d'un AUTRE workspace, c'est-a-dire dans le cas
--- normal (ALT+fleches, selecteur). Trace le 2026-08-19 a l'identique le matin et
--- le soir : « restore layout gave up workspace=modif-order » 3 s apres avoir
--- bascule sur chaud-devant, alors que le spawn avait bien cree sa fenetre.
+-- `SwitchToWorkspace { spawn = ... }` cree la fenetre EN DIFFERE. Entre la
+-- bascule et l'arrivee de cette fenetre, le GUI a deja detruit celle du
+-- workspace quitte et n'a plus rien a afficher : il se retrouve SANS AUCUNE
+-- FENETRE, process vivant mais invisible. Mesure le 2026-08-19 a 21:28:45 —
+-- `fenetres=0` avec deux process GUI en vie — apres quoi l'utilisateur relance
+-- WezTerm, d'ou des instances qui s'accumulent (3 process pour une fenetre).
 --
--- Cout reel du bug : la disposition n'etait JAMAIS rejouee. Il ne restait que la
--- fenetre a un pane creee par le `spawn` du SwitchToWorkspace, et l'auto-save
--- finissait par enteriner cet etat ampute a la place du bon enregistrement.
---
--- La cible est donc resolue par `workspace_mux_windows`, cote mux, ou le nom du
--- workspace fait foi. On attend la fenetre ET son pane d'accueil : la fenetre
--- apparait avant que son spawn n'ait produit son pane.
-local function restore_layout_when_ready(window, workspace, attempts)
-  attempts = attempts or 0
-
-  local host = nil
-
-  for _, mux_window in ipairs(workspace_mux_windows(workspace.name)) do
-    local ok, host_pane = pcall(function()
-      return mux_window:active_pane()
-    end)
-
-    if ok and host_pane ~= nil then
-      host = mux_window
-      break
-    end
-  end
-
-  if host then
-    restore_layout_in_window(window, host, workspace)
-    wezterm.GLOBAL[build_flight_key(workspace.name)] = nil
-    return
-  end
-
-  if attempts >= 30 then
-    append_debug('restore layout gave up (aucune fenetre d accueil) name='
-      .. tostring(workspace.name))
-    wezterm.GLOBAL[build_flight_key(workspace.name)] = nil
-    return
-  end
-
-  if wezterm.time and wezterm.time.call_after then
-    wezterm.time.call_after(0.1, function()
-      restore_layout_when_ready(window, workspace, attempts + 1)
-    end)
-  end
-end
-
+-- `wezterm.mux.spawn_window` est SYNCHRONE : il rend la fenetre, l'onglet et le
+-- pane immediatement. On peut donc poser toute la disposition avant que le GUI
+-- ne bascule, et il trouve une fenetre prete au lieu du vide. Corollaire : plus
+-- besoin d'attendre quoi que ce soit ensuite.
 local function restore_workspace_in_current_window(window, pane, workspace)
-  local first_tab = workspace.tabs[1]
+  local ok, first_tab, first_pane, mux_window = pcall(function()
+    return wezterm.mux.spawn_window(merge_spawn_options({
+      workspace = workspace.name,
+      domain = domains.spawn_domain(workspace.domain),
+    }, first_layout_spawn(workspace, 1, build_tab_layout(workspace.tabs[1]))))
+  end)
 
-  wezterm.GLOBAL[build_flight_key(workspace.name)] = os.time() + BUILD_FLIGHT_SECONDS
+  if not ok or not mux_window then
+    append_debug('restore spawn_window failed name=' .. tostring(workspace.name)
+      .. ' err=' .. tostring(first_tab))
+    notify_error(window, 'Impossible d ouvrir le workspace: ' .. workspace.name)
+    return false
+  end
+
+  restore_layout_in_window(window, mux_window, workspace, first_tab, first_pane)
 
   window:perform_action(
-    wezterm.action.SwitchToWorkspace {
-      name = workspace.name,
-      spawn = merge_spawn_options(
-        workspace_domain_spawn(workspace),
-        first_layout_spawn(workspace, 1, build_tab_layout(first_tab))
-      ),
-    },
+    wezterm.action.SwitchToWorkspace { name = workspace.name },
     pane
   )
-
-  restore_layout_when_ready(window, workspace)
 
   return true
 end
@@ -1385,17 +1337,6 @@ end
 local function restore_workspace(window, pane, workspace)
   append_debug('restore start name=' .. tostring(workspace.name)
     .. ' domain=' .. tostring(workspace.domain))
-
-  -- Reconstruction deja en vol : on se contente de basculer dessus. En relancer
-  -- une par-dessus creerait un deuxieme jeu de fenetres.
-  if build_in_flight(workspace.name) then
-    append_debug('restore deja en vol, simple bascule name=' .. tostring(workspace.name))
-    window:perform_action(
-      wezterm.action.SwitchToWorkspace { name = workspace.name },
-      pane
-    )
-    return
-  end
 
   -- Un domaine mux detache refuse tout spawn : le rattacher AVANT de restaurer,
   -- sinon le workspace s'ouvre vide. Le premier workspace distant ouvert depuis
