@@ -1993,15 +1993,19 @@ end
 --
 -- Re-enregistrer a chaque evaluation est le comportement CORRECT ici, pas une
 -- fuite : la table repart vide a chaque fois.
--- Le shell annonce son repertoire a chaque invite (cf. shell/wezterm.ps1) : c'est
--- le signal « quelque chose a change dans ce pane » le plus fiable dont on
--- dispose, et il couvre le `cd` comme la fermeture d'un pane. Le debounce
--- absorbe la rafale d'un demarrage de session.
-wezterm.on('user-var-changed', function(window, _, name)
-  if name == 'WEZTERM_WORKSPACE_CWD' then
-    save_window_soon(window)
-  end
-end)
+-- PAS de declencheur sur `user-var-changed`. Tentation evidente : le shell
+-- annonce son repertoire a chaque invite (cf. shell/wezterm.ps1), ce qui ferait
+-- un signal « ce pane a bouge » gratuit. Essaye le 2026-08-19, retire le meme
+-- soir : la cadence est imprevisible — une TUI qui redessine, un prompt qui se
+-- reaffiche, et l'evenement part en rafale. Chaque rafale relancait une capture
+-- toutes les 2 s, donc des allers-retours reseau pour chaque pane distant, sur
+-- le thread GUI. WezTerm s'est fige juste apres une restauration pourtant
+-- reussie.
+--
+-- On s'en tient donc aux ACTIONS explicites, dont on maitrise la frequence :
+-- split, nouvel onglet, renommage, ouverture d'un workspace. Un `cd` seul n'est
+-- pas enregistre tout de suite ; il le sera a la prochaine action ou a la
+-- prochaine ouverture du workspace.
 
 wezterm.on('update-status', function()
   -- Uniquement cote GUI. Le wezterm-mux-server local lit ce meme fichier de
