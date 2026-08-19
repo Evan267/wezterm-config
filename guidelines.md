@@ -169,6 +169,25 @@ Points de maintenance :
   La fenetre cible est desormais resolue par `workspace_mux_windows`, cote mux,
   ou le nom du workspace fait foi ; on attend la fenetre ET son pane d'accueil.
   Ne jamais reintroduire un test d'egalite de workspace sur `window:mux_window()`.
+- **Etat runtime HORS de `config_dir`** : le registre et le journal sont ecrits
+  dans `~/.wezterm-workspaces.json` et `~/.wezterm-workspaces.log`, **jamais**
+  dans `wezterm.config_dir`. WezTerm surveille son repertoire de config et
+  recharge TOUTE la configuration a la moindre ecriture dedans, meme sur un
+  fichier qui n'est pas du Lua : une seule ligne de journal declenche 3
+  reevaluations. Or un rechargement invalide l'etat de rendu — les panes servis
+  par un mux-server doivent re-recuperer leurs lignes et s'affichent ENTIEREMENT
+  EN BLOCS en attendant. C'est LA cause du bug « carres », longtemps impute au
+  front-end graphique puis au reseau ; symptomes qui le trahissent : apparition
+  sans rien toucher (cadence de l'auto-save) et a chaque restauration (qui
+  journalise plusieurs fois). Il tue aussi les timers en vol, donc la boucle
+  d'auto-sauvegarde. `migrate_state_location` reprend l'ancien registre une seule
+  fois. **Ne jamais rendre a ce module un chemin d'ecriture sous `config_dir`.**
+- **Une reconstruction EN VOL bloque les autres** (`build_in_flight`, cle plate
+  par workspace dans `wezterm.GLOBAL`, avec echeance) : le SwitchToWorkspace cree
+  la fenetre et le rejeu de la disposition n'arrive qu'ensuite ; pendant ces
+  quelques centaines de ms le workspace parait encore vide, donc une deuxieme
+  frappe en relance une par-dessus. Constate le 2026-08-19 : `test-restore`
+  reconstruit a 21:01:37 puis a 21:01:39, d'ou des fenetres « de partout ».
 - **Prechargement des connexions au demarrage** (`run_preload_once` ->
   `domains.preload`) : les domaines dont les workspaces ACTIFS ont besoin sont
   rattaches une fois par process, ~1 s apres le premier rendu, pour que leurs

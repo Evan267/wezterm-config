@@ -3,8 +3,27 @@ local domains = require 'lua/domains'
 local notifications = require 'lua/notify'
 local M = {}
 
-local registry_path = wezterm.config_dir .. '/workspaces.json'
-local debug_path = wezterm.config_dir .. '/workspaces-debug.log'
+-- Etat runtime (registre + journal) : DELIBEREMENT hors de `wezterm.config_dir`.
+--
+-- WezTerm surveille son repertoire de config et recharge TOUTE la configuration
+-- a la moindre ecriture dedans, y compris sur un fichier qui n'est pas du Lua.
+-- Mesure le 2026-08-18 : une seule ligne ajoutee au journal declenche 3
+-- reevaluations de la config. Chaque restauration (3 lignes) et chaque
+-- sauvegarde en provoquait donc autant. Or un rechargement invalide l'etat de
+-- rendu : les panes servis par un mux-server (`localmux` comme `vibe`) doivent
+-- re-recuperer leurs lignes et s'affichent ENTIEREMENT EN BLOCS en attendant.
+-- C'est LA cause du bug « carres » — ni le front-end graphique ni le reseau n'y
+-- sont pour quelque chose. Il tue aussi les timers en vol, donc la boucle
+-- d'auto-sauvegarde.
+--
+-- Directement dans `home_dir` et pas dans un sous-repertoire : Lua ne sait pas
+-- creer un repertoire sans lancer un shell. Meme convention que `~/.wezterm-tls`.
+--
+-- NE JAMAIS REMETTRE ICI UN FICHIER ECRIT EN COURS DE SESSION.
+local registry_path = wezterm.home_dir .. '/.wezterm-workspaces.json'
+local debug_path = wezterm.home_dir .. '/.wezterm-workspaces.log'
+-- Ancien emplacement, relu UNE fois pour reprendre le registre existant.
+local legacy_registry_path = wezterm.config_dir .. '/workspaces.json'
 local snapshot_version = 1
 
 local notify = notifications.info
@@ -67,6 +86,23 @@ local function write_file(path, content)
   file:close()
   return true
 end
+
+-- Reprise du registre laisse dans l'ancien emplacement. Copie unique : l'ancien
+-- fichier est laisse en place (il ne gene plus des lors que personne n'y ecrit),
+-- ce qui laisse aussi un filet si la nouvelle ecriture echoue.
+local function migrate_state_location()
+  if read_file(registry_path) then
+    return
+  end
+
+  local legacy = read_file(legacy_registry_path)
+
+  if legacy and legacy ~= '' then
+    write_file(registry_path, legacy)
+  end
+end
+
+migrate_state_location()
 
 local function append_debug(message)
   local file = io.open(debug_path, 'a')
@@ -1269,6 +1305,29 @@ local function restore_workspace_in_new_window(window, pane, workspace)
   return true
 end
 
+-- Une reconstruction est ASYNCHRONE : le SwitchToWorkspace cree la fenetre, et
+-- le rejeu de la disposition n'arrive qu'ensuite. Pendant ces quelques centaines
+-- de ms le workspace parait encore vide, donc une deuxieme frappe (ALT+fleches
+-- enchainees, selecteur) en relance une par-dessus — d'ou les fenetres qui
+-- s'ouvrent « de partout ». Constate le 2026-08-19 : `test-restore` reconstruit
+-- a 21:01:37 puis a 21:01:39.
+--
+-- Le drapeau vit dans `wezterm.GLOBAL` (il doit survivre a un rechargement de
+-- config, frequent sur ce depot) sous une cle PLATE par workspace : muter une
+-- table imbriquee de GLOBAL n'est pas fiable. Il porte une echeance, pour qu'une
+-- reconstruction morte ne bloque pas le workspace pour toujours.
+local BUILD_FLIGHT_SECONDS = 10
+
+local function build_flight_key(name)
+  return 'workspace_build_in_flight_' .. tostring(name)
+end
+
+local function build_in_flight(name)
+  local deadline = wezterm.GLOBAL[build_flight_key(name)]
+
+  return type(deadline) == 'number' and os.time() < deadline
+end
+
 -- `mux_window` est fournie par l'appelant, resolue COTE MUX (cf.
 -- restore_layout_when_ready) : ne jamais la redemander a `window:mux_window()`.
 local function restore_layout_in_window(window, mux_window, workspace)
@@ -1337,12 +1396,14 @@ local function restore_layout_when_ready(window, workspace, attempts)
 
   if host then
     restore_layout_in_window(window, host, workspace)
+    wezterm.GLOBAL[build_flight_key(workspace.name)] = nil
     return
   end
 
   if attempts >= 30 then
     append_debug('restore layout gave up (aucune fenetre d accueil) name='
       .. tostring(workspace.name))
+    wezterm.GLOBAL[build_flight_key(workspace.name)] = nil
     return
   end
 
@@ -1355,6 +1416,8 @@ end
 
 local function restore_workspace_in_current_window(window, pane, workspace)
   local first_tab = workspace.tabs[1]
+
+  wezterm.GLOBAL[build_flight_key(workspace.name)] = os.time() + BUILD_FLIGHT_SECONDS
 
   window:perform_action(
     wezterm.action.SwitchToWorkspace {
@@ -1376,6 +1439,17 @@ local function restore_workspace(window, pane, workspace, mode)
   mode = mode or 'current'
   append_debug('restore start name=' .. tostring(workspace.name)
     .. ' mode=' .. tostring(mode) .. ' domain=' .. tostring(workspace.domain))
+
+  -- Reconstruction deja en vol : on se contente de basculer dessus. En relancer
+  -- une par-dessus creerait un deuxieme jeu de fenetres.
+  if build_in_flight(workspace.name) then
+    append_debug('restore deja en vol, simple bascule name=' .. tostring(workspace.name))
+    window:perform_action(
+      wezterm.action.SwitchToWorkspace { name = workspace.name },
+      pane
+    )
+    return
+  end
 
   -- Un domaine mux detache refuse tout spawn : le rattacher AVANT de restaurer,
   -- sinon le workspace s'ouvre vide. Le premier workspace distant ouvert depuis

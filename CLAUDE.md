@@ -65,6 +65,17 @@ il hérite de `default_prog` mais fige la config à son démarrage. Tout changem
 du domaine mux distant (port, IP, certificats dans `~/.wezterm-tls`) doit rester
 cohérent avec le `~/.wezterm.lua` de vibe. Voir `VIBE_TLS_SETUP.md`.
 
-Ne jamais versionner l'état runtime ni la config par-machine (`workspaces.json`,
-`workspaces-debug.log`, `.env`) : ils sont dans `.gitignore`. Seul `.env.example`
-(modèle) est versionné.
+L'état runtime vit **hors du dépôt ET hors du répertoire de config** :
+`~/.wezterm-workspaces.json` (registre) et `~/.wezterm-workspaces.log` (journal).
+WezTerm recharge toute sa configuration à la moindre écriture dans
+`wezterm.config_dir` — même sur un fichier qui n'est pas du Lua — ce qui invalide
+l'état de rendu et repeint les panes mux entièrement en blocs, en plus de tuer
+les timers en vol. Ne jamais y remettre un fichier écrit en cours de session.
+
+Corollaire pour toute session de travail sur ce dépôt : **éditer ces fichiers
+perturbe l'affichage du terminal en cours d'utilisation**. Grouper les écritures
+plutôt que de les enchaîner.
+
+Les anciens `workspaces.json` / `workspaces-debug.log` restent dans `.gitignore`
+tant qu'ils traînent sur les postes. Ne jamais versionner `.env` non plus ; seul
+`.env.example` (modèle) est versionné.
