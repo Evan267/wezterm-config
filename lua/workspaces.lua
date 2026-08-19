@@ -29,6 +29,13 @@ local snapshot_version = 1
 -- n'est pas un workspace de travail, et c'est la qu'on relegue les fenetres qui
 -- n'ont rien a faire ailleurs (cf. evict_foreign_windows).
 local scratch_workspace = 'default'
+
+-- `default` est le workspace de PASSAGE de WezTerm : celui qu'on obtient sans
+-- rien demander. Ce n'est pas un workspace de travail, il n'est donc jamais
+-- enregistre.
+local function is_saveable_workspace(name)
+  return type(name) == 'string' and name ~= '' and name ~= scratch_workspace
+end
 -- Workspace de PARKING : n'est jamais l'actif, donc son contenu n'est jamais
 -- affiche. On y jette les fenetres d'amorcage des mux-servers des leur import.
 -- Le deplacement est INSTANTANE, la ou fermer suppose un aller-retour avec le
@@ -1348,6 +1355,12 @@ local function apply_layout(target_pane, node, workspace, tab_index)
   end
 end
 
+
+-- Duree pendant laquelle une reconstruction est consideree « en vol ». Elle
+-- couvre le temps que la fenetre du workspace apparaisse et que sa disposition
+-- soit posee ; pendant ce temps, une deuxieme entree sur le meme workspace se
+-- contente de basculer au lieu d'en reconstruire un second jeu.
+local BUILD_FLIGHT_SECONDS = 10
 
 local function build_flight_key(name)
   return 'workspace_build_in_flight_' .. tostring(name)

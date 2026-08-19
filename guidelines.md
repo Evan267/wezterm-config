@@ -476,8 +476,21 @@ Verifier une modification, dans cet ordre :
    ou `LEADER` — dans la sortie de `show-keys`. Absent = repli sur le defaut,
    donc echec de chargement.
 
-3. Redemarrer ou recharger WezTerm et tester les raccourcis modifies.
-4. Controler le diff : `git diff --check`, `git status --short`.
+3. **Aucun identifiant orphelin ?**
+
+   ```powershell
+   python tools/check-lua-identifiers.py lua/workspaces.lua
+   ```
+
+   Lua ne signale un appel a une fonction inexistante qu'a l'EXECUTION, et
+   souvent dans un `pcall` qui l'avale. Le 2026-08-19, trois pannes ont eu cette
+   meme cause : un helper supprime avec le bloc qui l'entourait, ses appelants
+   restes en place. `pane_cwd`, puis `cwd_key`, puis `BUILD_FLIGHT_SECONDS` —
+   cette derniere faisait echouer TOUTE ouverture de workspace, sans une ligne de
+   journal. Le controle prend deux secondes et les aurait toutes attrapees.
+
+4. Redemarrer ou recharger WezTerm et tester les raccourcis modifies.
+5. Controler le diff : `git diff --check`, `git status --short`.
 
 **Ne jamais ecrire d'antislash echappe depuis un outil d'edition automatique.**
 Deux modules ont ete casses le meme soir par un `\` reduit a `\` en cours de
