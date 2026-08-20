@@ -155,7 +155,7 @@ Points de maintenance :
   elle existait pour rattraper l'asynchronisme du rattachement au demarrage, qui
   n'a plus lieu.
 - **Un objet `GuiWindow` de callback est FIGE sur sa fenetre mux**
-  (`restore_layout_when_ready`, section Workspaces). Le `window` passe au
+  (`restore_layout_in_window`, section Workspaces). Le `window` passe au
   callback d'un raccourci reste lie a la fenetre MUX qu'il avait au moment de la
   frappe : apres un `SwitchToWorkspace` il continue de rendre l'ANCIEN workspace,
   indefiniment tant que cette fenetre vit ailleurs dans le mux. L'attente du
@@ -166,38 +166,35 @@ Points de maintenance :
   `chaud-devant`, alors que le spawn avait bien cree sa fenetre. Cout reel : la
   disposition n'etait JAMAIS rejouee, il ne restait que la fenetre a un pane
   creee par le spawn, et l'auto-save finissait par enteriner cet etat ampute.
-  La fenetre cible est desormais resolue par `workspace_mux_windows`, cote mux,
-  ou le nom du workspace fait foi ; on attend la fenetre ET son pane d'accueil.
-  Ne jamais reintroduire un test d'egalite de workspace sur `window:mux_window()`.
-- **Expulser les fenetres INTRUSES apres un rattachement** (`evict_foreign_windows`).
-  Un `wezterm-mux-server` spawne une fenetre pour lui-meme a son demarrage — ce
-  n'est pas evitable, un handler `mux-startup` ne l'inhibe pas contrairement a
-  `gui-startup`. Au rattachement du domaine, WezTerm importe les fenetres du
-  serveur, celle-la comprise, et la place dans le workspace **ACTIF a cet
-  instant** : elle atterrit donc au milieu du workspace qu'on est en train
-  d'ouvrir, une fois par domaine et par session. C'est la « fenetre qui s'ouvre a
-  la premiere connexion, puis plus rien » rapportee le 2026-08-19 ; le registre
-  du jour en garde deux traces : un pane `vibe` dans `chaud-devant` (workspace
-  localmux) et un pwsh `localmux` dans `modif-order` (workspace vibe).
-  - Le critere n'est **pas** heuristique : une fenetre dont les panes ne tournent
-    pas sur le domaine du workspace n'a rien a y faire. Un workspace legitime a
-    toutes ses fenetres sur son propre domaine, par construction. Pas de test sur
-    le cwd, le titre ou le nombre de panes — ils auraient fini par se tromper.
-  - On DEPLACE vers le workspace de passage, on ne ferme pas : `MuxWindow`
-    n'expose ni `close` ni `kill` (verifie dans le binaire ; `set_workspace`, si).
-    La fenetre reste accessible, elle ne gene simplement plus.
-  - Passe rejouee 1,5 s plus tard : l'import des fenetres distantes est asynchrone.
-- **C'est `SwitchToWorkspace` qui doit creer la fenetre, pas nous.** Tentation
-  a ne pas suivre : la creer soi-meme avec `wezterm.mux.spawn_window` puis
-  basculer, pour eviter le court instant ou le GUI n'a rien a afficher.
-  Essayee le 2026-08-19 (commit 8a40e21), annulee le meme soir : la fenetre
-  ainsi creee atterrit dans le workspace ACTIF et non dans celui demande,
-  malgre le champ `workspace` passe au spawn. Chaque ouverture de
-  `chaud-devant` deposait donc une copie complete de sa session dans
-  `modif-order` — deux copies constatees, plus une troisieme au bon endroit.
-  `SwitchToWorkspace { spawn = ... }` cree la fenetre DANS le workspace cible,
-  parce que c'est lui qui pilote la bascule ; on attend ensuite cette fenetre
-  cote mux (`restore_layout_when_ready`) pour y poser la disposition.
+  La fenetre cible est desormais celle que `spawn_workspace_window` vient de
+  creer cote mux : on la garde sous la main au lieu de la redemander. Ne jamais
+  reintroduire un test d'egalite de workspace sur `window:mux_window()`.
+- **La fenetre d'amorcage du mux-server se GARE A LA SOURCE, elle ne se
+  pourchasse pas** (`mux-startup`, dans `lua/domains.lua`). Un
+  `wezterm-mux-server` ouvre une fenetre pour lui-meme a son demarrage s'il n'a
+  aucun pane dans son domaine par defaut. Un handler `mux-startup` ne l'inhibe
+  pas, contrairement a `gui-startup` — mais il peut la DEVANCER : creer ce
+  premier pane nous-memes, dans le workspace de parking, dispense le serveur d'en
+  creer un. Sans cela, cette fenetre atterrit dans `default` et le client la
+  reimporte a chaque rattachement.
+  - **Ne pas revenir a un balayage.** La version precedente
+    (`evict_foreign_windows`) inspectait toutes les fenetres importees toutes les
+    0,5 s pendant 25 s apres chaque rattachement, en lisant le repertoire de
+    CHAQUE pane — un aller-retour reseau synchrone par pane distant, sur le
+    thread GUI. Elle a fige WezTerm (`Responding=False`, journal arrete net) et a
+    ete supprimee (e5060dc). Le parking a la source n'a ni timer, ni balayage, ni
+    lecture de pane.
+  - **On DEPLACE, on ne ferme pas** : `MuxWindow` n'expose ni `close` ni `kill`
+    (verifie dans le binaire ; `set_workspace`, si). Une fenetre garee reste
+    accessible, elle ne gene simplement plus — le parking n'est jamais le
+    workspace actif.
+- **La fenetre d'un workspace, c'est NOUS qui la creons** — et le detour par le
+  parking en fait partie. Voir la section Workspaces
+  (`spawn_workspace_window`) : `SwitchToWorkspace { spawn = ... }` depose la
+  fenetre dans le workspace ACTIF, `workspace = <cible>` au spawn ne corrige que
+  le cote client, et seul `set_workspace` remet le mux-server d'accord. Les deux
+  approches naives ont chacune ete essayees et annulees (8a40e21/38ccd14, puis le
+  retour a `SwitchToWorkspace` lui-meme) : ne pas refaire le tour.
 - **UNE SEULE FENETRE OUVERTE, TOUJOURS.** Invariant du depot, pose le
   2026-08-19 : rien dans cette config ne doit ouvrir une fenetre a cote. Le mode
   « ouvrir en nouvelle fenetre » (`restore_workspace_in_new_window`, le mode
@@ -210,13 +207,12 @@ Points de maintenance :
     2026-08-19 : une seule fenetre visible dans le systeme, et `windows=1` par
     workspace cote mux, bascule apres bascule. Rien ne s'accumule ; c'est une
     nouvelle fenetre OS, pas une fenetre en trop.
-  - **Limite connue, non resolue** : le `wezterm-mux-server` spawne sa propre
-    fenetre a son demarrage, dans le workspace `default`. Une fois le mux
-    rattache, `default` compte donc la fenetre du GUI (domaine integre) ET
-    celle-la. L'API Lua n'offre aucun moyen de fermer une fenetre mux : ni
-    `MuxWindow` ni `MuxTab` n'exposent de `close`/`kill`. Ne pas perdre de temps
-    a chercher, c'est verifie. On ne la voit qu'en etant sur `default`, qui n'est
-    pas un workspace de travail.
+  - **Ce que le mux-server ajoute** : il spawne sa propre fenetre a son
+    demarrage. Elle est desormais garee dans le workspace de parking par le
+    handler `mux-startup` (voir plus haut), donc invisible. L'API Lua n'offre
+    aucun moyen de FERMER une fenetre mux : ni `MuxWindow` ni `MuxTab` n'exposent
+    de `close`/`kill`. Ne pas perdre de temps a chercher, c'est verifie — c'est
+    aussi pourquoi on gare au lieu de fermer.
 - **Taille des splits en RATIO, jamais en absolu** (`apply_layout`) : la coupe
   est calculee comme `second_size / total` et passee en fraction a
   `pane:split`, donc relative a la fenetre DU MOMENT. Un workspace capture en 159
@@ -263,20 +259,35 @@ Points de maintenance :
   quelques centaines de ms le workspace parait encore vide, donc une deuxieme
   frappe en relance une par-dessus. Constate le 2026-08-19 : `test-restore`
   reconstruit a 21:01:37 puis a 21:01:39, d'ou des fenetres « de partout ».
-- **Prechargement des connexions au demarrage** (`run_preload_once` ->
-  `domains.preload`) : les domaines dont les workspaces ACTIFS ont besoin sont
-  rattaches une fois par process, ~1 s apres le premier rendu, pour que leurs
-  sessions soient deja la au moment de basculer dessus. **On SONDE avant de
-  rattacher**, et c'est tout l'interet : `domain:attach()` est synchrone sur le
-  thread GUI et gele tout WezTerm le temps du timeout TCP quand la cible ne
-  repond pas (mesure le 2026-08-19 sur vibe : 12 s). Le probe, lui, a un timeout
-  qu'on choisit (800 ms, mesure a 407 ms serveur joignable).
-  - domaine distant : poignee de main TCP bornee, sans TLS — on ne cherche qu'a
-    savoir si le port repond ;
-  - mux local : on verifie qu'il TOURNE DEJA, on ne le demarre pas. Un
-    mux-server qui demarre spawne sa propre fenetre, qui apparaitrait dans le
-    workspace de passage sans que personne ne l'ait demandee. S'il est eteint il
-    n'y a rien a precharger : le premier workspace ouvert le demarrera.
+- **AMORCAGE : demarrer, puis rattacher — jamais sous une frappe.**
+  `domain:attach()` est SYNCHRONE sur le thread GUI. Deux couts distincts s'y
+  cachent, et les confondre est la cause de tous les gels mesures sur ce depot :
+  - **demarrer** un mux-server (creation de process, lecture de config, shell) :
+    4,4 s mesurees le 2026-08-20 sur le mux local, interface entierement morte,
+    et cela tombait pile sur la frappe qui ouvrait le premier workspace local
+    (journal GUI : « Will try spawning the server » a 09:18:06, workspace ouvert
+    a 09:18:09) ;
+  - **joindre** un serveur injoignable : 12 s mesurees le 2026-08-19 sur vibe,
+    le temps du timeout TCP.
+  D'ou la sequence, en deux temps (`run_preload_once`) :
+  - `t+0` : `domains.start_local_mux()` — `wezterm.background_child_process`,
+    qui n'attend RIEN, contrairement a `run_child_process`. Uniquement si un
+    workspace actif vit sur le mux local. C'est la seule operation vraiment
+    couteuse et on ne peut pas la raccourcir : on la lance donc au plus tot.
+    Possible seulement depuis que la fenetre d'amorcage du serveur est garee
+    (cf. `mux-startup`) ; c'est elle qui interdisait ce demarrage anticipe.
+  - `t+2 s` : `domains.preload()` rattache. Rattacher un serveur QUI TOURNE est
+    bon marche ; le distant est en plus sonde avant (poignee de main TCP bornee
+    a 800 ms, sans TLS — mesure a 407 ms serveur joignable), pour ne jamais
+    payer le timeout.
+  - **Sous une frappe, on ne rattache jamais** : `restore_workspace` interroge
+    `domains.is_attached` (lecture d'etat pure), et si le domaine n'est pas
+    pret il demande le demarrage, notifie, et se rappelle en differe
+    (`ATTACH_RETRY_DELAY`, six essais). Le terminal reste vivant et
+    l'utilisateur voit un message au lieu d'un fige. Ne pas remettre
+    `ensure_attached` dans un chemin declenche par une touche — y compris dans
+    la boucle de `restore_all_active`, ou il sondait tous les domaines d'affilee
+    avant la moindre ouverture.
 - **Les handlers d'evenement ne sont enregistres QU'UNE FOIS par process**
   (`wezterm.GLOBAL.workspace_handlers_version`, meme garde-fou que le theme dans
   `lua/options.lua`). Chaque rechargement de config reevalue les modules ; un
@@ -284,8 +295,10 @@ Points de maintenance :
   depot les rechargements sont frequents (toute ecriture dans `config_dir`).
 - **Rattachement** (`ensure_attached`) : un domaine mux **detache refuse tout
   spawn**. Toute restauration ou creation sur un domaine mux — `localmux`
-  compris, seul `local` est exempt — doit appeler `domains.ensure_attached`
-  AVANT de spawner, sinon le workspace s'ouvre vide. Ne pas regresser.
+  compris, seul `local` est exempt — doit donc etre rattachee AVANT de spawner,
+  sinon le workspace s'ouvre vide. Le rattachement lui-meme est bloquant : il se
+  fait au demarrage ou en differe, jamais dans le fil d'une frappe (voir
+  l'amorcage ci-dessus). Ne pas regresser.
 - **`is_local` vs `is_remote`** : la distinction porte sur la MACHINE, pas sur
   la persistance. `is_local` couvre `local` ET `localmux` ; c'est elle qui decide
   du shell de rejeu (cf. section Workspaces) et de la couleur du statut. Un
@@ -379,11 +392,42 @@ Le module `lua/workspaces.lua` capture/restaure les workspaces dans
   « deja ouverts »). `workspace_pane_count` journalise l'etat vu du mux
   (`windows=/tabs=/panes=`) dans `workspaces-debug.log` : c'est le point d'entree
   pour diagnostiquer un saut inattendu. Ne pas regresser.
-- **`workspace` obligatoire dans `mux.spawn_window`** : sans ce champ, la fenetre
-  spawnee atterrit dans le workspace **actif**, pas dans celui restaure — le
-  workspace cible restait une coquille vide pendant que son contenu s'ouvrait
-  ailleurs. `restore_workspace_in_new_window` passe donc `workspace` et `domain`.
-  Ne pas regresser.
+- **La fenetre d'un workspace se cree dans le PARKING, puis se RENOMME**
+  (`spawn_workspace_window`, unique porte d'entree : restauration, entree sans
+  snapshot, et creation `ALT+n`). C'est le point le plus contre-intuitif du
+  module, et il a deja ete casse deux fois dans les deux sens :
+  - `SwitchToWorkspace { spawn = ... }` ne cree PAS la fenetre dans le workspace
+    demande. WezTerm la cree dans `mux.active_workspace()`
+    (wezterm-gui/src/spawn.rs), et `ClientDomain::spawn` envoie cette meme
+    valeur au mux-server. Or `reconcile_workspace`
+    (wezterm-gui/src/frontend.rs) constate que le workspace tout juste active
+    est encore vide et se rabat d'autorite sur le premier workspace non vide
+    (`default`) ; son garde-fou `switching_workspaces` est un booleen unique du
+    front-end, que la premiere bascule aboutie efface pour toutes celles encore
+    en vol. Deux ouvertures de suite (`ALT+SHIFT+R`) suffisent donc a l'ouvrir.
+    Constat du 2026-08-20 : deux fenetres `default` cote mux-server portant le
+    cwd de `chaud-devant`, aucune fenetre ou poser la disposition, et une volee
+    de fenetres parasites a chaque rattachement suivant, ces fenetres survivant
+    au GUI.
+  - Passer `workspace = <cible>` a `mux.spawn_window` ne suffit pas non plus :
+    ce champ ne corrige que le cote CLIENT. Le mux-server, lui, garde
+    l'etiquette du workspace actif et ressort les panes dans le workspace
+    courant au rattachement suivant (le piege de 8a40e21, revert 38ccd14).
+  - Seul `MuxWindow:set_workspace` corrige les deux : il emet
+    `WindowWorkspaceChanged`, que le client traduit en `SetWindowWorkspace` pour
+    le serveur. D'ou la naissance dans le parking : `set_workspace` ne notifie
+    rien si le nom ne change pas, la fenetre doit donc naitre AILLEURS que dans
+    sa cible. Le parking n'etant jamais l'actif, rien n'apparait a l'ecran.
+  - La bascule qui suit ne porte alors plus de `spawn` : elle rejoint une
+    fenetre existante. Ne pas regresser.
+- **Fenetre d'amorcage du mux-server** (`mux-startup`, dans `lua/domains.lua`) :
+  `wezterm-mux-server` ouvre une fenetre a son demarrage s'il n'a aucun pane
+  dans son domaine par defaut. Sans workspace demande, elle atterrit dans
+  `default` et le GUI la reimporte a chaque rattachement. On ne peut pas
+  l'empecher, on la CHOISIT : le handler cree ce premier pane dans le parking,
+  ce qui dispense le serveur d'en creer un. Surtout, ne pas revenir a un
+  balayage des fenetres importees pour les deloger apres coup : cette version-la
+  a fige le GUI (cf. e5060dc).
 - **Auto-sauvegarde** (`M.start_auto_save`, branchee depuis `wezterm.lua`) :
   boucle `wezterm.time.call_after` toutes les `auto_save_interval` s (60), qui
   rafraichit les snapshots des workspaces deja presents dans le registre.
@@ -448,20 +492,21 @@ Le module `lua/workspaces.lua` capture/restaure les workspaces dans
   `domains.pane_domain`, qui doit rester **fidele** au pane reel : c'est lui qui
   alimente la barre de statut et la comparaison de `adopt_domain_session`. Les
   reecrire tous les deux ferait croire a une session persistante inexistante.
-- **Domaine de spawn depuis un selecteur** (`workspace_domain_spawn`) : le `pane`
-  passe au callback d'un `InputSelector` / `PromptInputLine` est le pane
-  **d'overlay** (`TermWizTerminalPane`), pas un pane du domaine `vibe`. Tout
-  `SwitchToWorkspace` declenche depuis un tel callback doit donc porter un
-  `spawn` avec `domain = 'DefaultDomain'` : sans lui, WezTerm resout
+- **Domaine de spawn explicite** (`workspace_domain_spawn`) : le `pane` passe au
+  callback d'un `InputSelector` / `PromptInputLine` est le pane **d'overlay**
+  (`TermWizTerminalPane`), pas un pane du domaine vise. Tout spawn declenche
+  depuis un tel callback doit donc nommer son domaine : sans lui, WezTerm resout
   `CurrentPaneDomain` vers `TermWizTerminalDomain` et refuse le spawn (`cannot
   spawn panes in a TermWizTerminalPane`, visible dans
   `~/.local/share/wezterm/wezterm-gui.exe-log-*.txt`) — le workspace s'ouvrait
-  alors **sans aucun pane**. Attention : `SwitchToWorkspace` sans `spawn` du tout
-  n'est pas neutre, il retombe sur `SpawnCommand::default()`, donc sur
-  `CurrentPaneDomain`. Seul le cas « workspace deja vivant » peut s'en passer (il
-  ne spawne rien). Le domaine passe est desormais **celui du workspace** et non
+  alors **sans aucun pane**. Le domaine passe est **celui du workspace** et non
   `DefaultDomain` : le defaut varie par fenetre depuis `ALT+SHIFT+D`, un
-  workspace doit se restaurer la ou il a ete capture. Ne pas regresser.
+  workspace doit se restaurer la ou il a ete capture.
+  Corollaire de la creation via `spawn_workspace_window` : un
+  `SwitchToWorkspace` du depot ne porte plus jamais de `spawn`, et ne doit en
+  porter que si sa cible est **deja vivante** — sur un workspace vide, une
+  bascule sans `spawn` n'est pas neutre pour autant, elle retombe sur
+  `SpawnCommand::default()`, donc sur `CurrentPaneDomain`. Ne pas regresser.
 
 ## Documentation
 

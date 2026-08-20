@@ -26,21 +26,31 @@ local debug_path = wezterm.home_dir .. '/.wezterm-workspaces.log'
 local legacy_registry_path = wezterm.config_dir .. '/workspaces.json'
 local snapshot_version = 1
 -- Workspace de PASSAGE de WezTerm : celui qu'on obtient sans rien demander. Ce
--- n'est pas un workspace de travail, et c'est la qu'on relegue les fenetres qui
--- n'ont rien a faire ailleurs (cf. evict_foreign_windows).
+-- n'est pas un workspace de travail, il n'est donc jamais enregistre.
 local scratch_workspace = 'default'
 
--- `default` est le workspace de PASSAGE de WezTerm : celui qu'on obtient sans
--- rien demander. Ce n'est pas un workspace de travail, il n'est donc jamais
--- enregistre.
-local function is_saveable_workspace(name)
-  return type(name) == 'string' and name ~= '' and name ~= scratch_workspace
-end
 -- Workspace de PARKING : n'est jamais l'actif, donc son contenu n'est jamais
--- affiche. On y jette les fenetres d'amorcage des mux-servers des leur import.
--- Le deplacement est INSTANTANE, la ou fermer suppose un aller-retour avec le
--- shell — c'est ce delai qui les laissait visibles au lancement.
-local parking_workspace = 'wezterm-amorcage'
+-- affiche. Deux usages :
+--   - le mux-server y gare la fenetre qu'il ouvre a son demarrage (le handler
+--     `mux-startup` est dans lua/domains.lua, avec le reste du savoir sur les
+--     mux-servers) ;
+--   - toute fenetre de workspace y NAIT avant d'etre renommee vers sa cible
+--     (cf. spawn_workspace_window, qui explique pourquoi ce detour est le seul
+--     chemin correct).
+--
+-- Declare AVANT `is_saveable_workspace`, qui s'en sert : un `local` lu plus haut
+-- dans le fichier ne serait pas le meme nom, ce serait un global a nil, et le
+-- test passerait silencieusement.
+local parking_workspace = domains.PARKING
+
+-- Ni le workspace de passage ni le garage ne sont des workspaces de travail :
+-- aucun des deux n'a de raison d'entrer dans le registre.
+local function is_saveable_workspace(name)
+  return type(name) == 'string'
+    and name ~= ''
+    and name ~= scratch_workspace
+    and name ~= parking_workspace
+end
 
 local notify = notifications.info
 local notify_error = notifications.error
@@ -1169,34 +1179,47 @@ wezterm.on('window-resized', function(window)
   save_window_soon(window, resize_debounce)
 end)
 -- ---------------------------------------------------------------------------
--- Prechargement des connexions, une fois par process
+-- AMORCAGE : demarrer, puis rattacher — jamais sous une frappe
 --
--- Rattache les domaines dont les workspaces ACTIFS ont besoin, pour que leurs
--- sessions soient deja la quand on bascule dessus au lieu d'etre rattachees dans
--- l'urgence d'une frappe. `domains.preload` sonde avant de rattacher : il ne
--- demarre pas le mux local s'il est eteint et ne touche pas a un serveur distant
--- qui ne repond pas, donc aucun risque de gel.
+-- Les domaines dont les workspaces ACTIFS ont besoin sont prepares au lancement,
+-- pour que leurs sessions soient deja la au moment d'y basculer. En deux temps,
+-- et l'ordre compte :
 --
--- Le delai laisse la premiere fenetre s'afficher : meme court, un probe reste du
--- travail synchrone sur le thread GUI.
+--   t+0   le mux local est DEMARRE, en tache de fond, si un workspace actif y
+--         vit. C'est la seule operation vraiment couteuse de la chaine (creation
+--         de process, lecture de config, shell) et la seule qu'on ne peut pas
+--         raccourcir : on la lance donc au plus tot, sans rien attendre.
+--   t+2s  les domaines sont RATTACHES. Rattacher est synchrone sur le thread
+--         GUI, mais c'est bon marche face a un serveur qui tourne deja — tout
+--         le cout venait de son demarrage, que les 2 s ont couvert.
+--
+-- Ne pas confondre les deux : c'est en les melangeant (rattacher un serveur
+-- eteint, donc le demarrer au passage) qu'on gelait 4,4 s d'interface, et sous
+-- la frappe qui ouvrait le workspace plutot qu'au lancement.
 local preload_flag = 'workspace_preload_done'
-local preload_delay = 1
+local preload_delay = 2
 
-local function preload_domains()
-  local seen = {}
+-- Domaines effectivement utilises par les workspaces actifs, sans doublon.
+local function active_domains()
+  local seen, ordered = {}, {}
 
   for _, workspace in ipairs(list_workspaces(load_registry(), 'active')) do
     local domain = domains.normalize(workspace.domain)
 
     if domain and not seen[domain] then
       seen[domain] = true
-      local ok, reason = domains.preload(domain)
-      append_debug('prechargement domaine=' .. domain
-        .. ' ok=' .. tostring(ok) .. ' (' .. tostring(reason) .. ')')
-
-      if ok then
-      end
+      table.insert(ordered, domain)
     end
+  end
+
+  return ordered
+end
+
+local function preload_domains(wanted)
+  for _, domain in ipairs(wanted) do
+    local ok, reason = domains.preload(domain)
+    append_debug('prechargement domaine=' .. domain
+      .. ' ok=' .. tostring(ok) .. ' (' .. tostring(reason) .. ')')
   end
 end
 
@@ -1211,8 +1234,17 @@ local function run_preload_once()
     return
   end
 
+  local wanted = active_domains()
+
+  for _, domain in ipairs(wanted) do
+    if domains.is_local(domain) then
+      domains.start_local_mux()
+      break
+    end
+  end
+
   wezterm.time.call_after(preload_delay, function()
-    local ok, err = pcall(preload_domains)
+    local ok, err = pcall(preload_domains, wanted)
 
     if not ok then
       append_debug('prechargement erreur: ' .. tostring(err))
@@ -1390,10 +1422,10 @@ local function apply_layout(target_pane, node, workspace, tab_index)
 end
 
 
--- Duree pendant laquelle une reconstruction est consideree « en vol ». Elle
--- couvre le temps que la fenetre du workspace apparaisse et que sa disposition
--- soit posee ; pendant ce temps, une deuxieme entree sur le meme workspace se
--- contente de basculer au lieu d'en reconstruire un second jeu.
+-- Duree pendant laquelle une reconstruction est consideree « en vol ». La
+-- construction est synchrone, mais elle rend la main a chaque spawn (fenetre,
+-- onglet, split) : une deuxieme entree sur le meme workspace peut donc s'y
+-- glisser, et elle en reconstruirait un second jeu complet.
 local BUILD_FLIGHT_SECONDS = 10
 
 local function build_flight_key(name)
@@ -1406,8 +1438,11 @@ local function build_in_flight(name)
   return type(deadline) == 'number' and os.time() < deadline
 end
 
--- `mux_window` est fournie par l'appelant, resolue COTE MUX (cf.
--- restore_layout_when_ready) : ne jamais la redemander a `window:mux_window()`.
+-- `mux_window` est celle que l'appelant vient de creer COTE MUX : ne jamais la
+-- redemander a `window:mux_window()`. L'objet GuiWindow passe au callback d'un
+-- raccourci reste lie a la fenetre mux qu'il avait au moment de la frappe, donc
+-- a l'ANCIEN workspace — indefiniment, tant que cette fenetre vit encore
+-- ailleurs dans le mux.
 local function restore_layout_in_window(window, mux_window, workspace)
   local first_tab = workspace.tabs[1]
   local first_layout = build_tab_layout(first_tab)
@@ -1435,114 +1470,181 @@ local function restore_layout_in_window(window, mux_window, workspace)
   end
 end
 
--- Le SwitchToWorkspace n'est pas synchrone : la fenetre mux du workspace cible
--- n'existe pas encore au retour de `perform_action`. On l'attend, puis on y
--- rejoue la disposition.
+-- ---------------------------------------------------------------------------
+-- CREATION DE LA FENETRE D'UN WORKSPACE
 --
--- ON NE DEMANDE JAMAIS SON WORKSPACE A `window:mux_window()`. L'objet GuiWindow
--- passe au callback d'un raccourci reste lie a la fenetre MUX qu'il avait au
--- moment de la frappe : apres un SwitchToWorkspace il continue de designer
--- l'ancienne fenetre, donc l'ANCIEN workspace — indefiniment, tant que cette
--- fenetre vit encore ailleurs dans le mux. Le test d'egalite echouait donc
--- toujours des lors qu'on venait d'un AUTRE workspace, c'est-a-dire dans le cas
--- normal (ALT+fleches, selecteur). Trace le 2026-08-19 a l'identique le matin et
--- le soir : « restore layout gave up workspace=modif-order » 3 s apres avoir
--- bascule sur chaud-devant, alors que le spawn avait bien cree sa fenetre.
+-- C'est le SEUL endroit du depot qui cree la fenetre d'un workspace, et il
+-- n'utilise PAS `SwitchToWorkspace { spawn = ... }`. Ce spawn-la ne met pas la
+-- fenetre dans le workspace demande : WezTerm la cree dans
+-- `mux.active_workspace()` (wezterm-gui/src/spawn.rs), et `ClientDomain::spawn`
+-- envoie cette meme valeur au mux-server (wezterm-client/src/domain.rs). Or
+-- l'actif n'est pas forcement la cible : `reconcile_workspace`
+-- (wezterm-gui/src/frontend.rs) voit que le workspace qu'on vient d'activer est
+-- encore VIDE et bascule d'autorite sur le premier workspace non vide qu'il
+-- trouve — `default`. Le garde-fou cense l'en empecher
+-- (`switching_workspaces`) est un booleen UNIQUE du front-end : deux bascules en
+-- vol (ALT+SHIFT+R en enchaine trois) et la premiere qui aboutit l'efface pour
+-- les suivantes.
 --
--- Cout reel du bug : la disposition n'etait JAMAIS rejouee. Il ne restait que la
--- fenetre a un pane creee par le `spawn` du SwitchToWorkspace, et l'auto-save
--- finissait par enteriner cet etat ampute a la place du bon enregistrement.
+-- Mesure le 2026-08-20 sur `chaud-devant` (localmux) : deux fenetres etiquetees
+-- `default` cote serveur (`wezterm cli list`), portant le cwd du workspace
+-- demande, et aucune fenetre dans `chaud-devant` ou poser la disposition. Elles
+-- SURVIVENT au GUI : chaque rattachement suivant les reimporte, d'ou la volee de
+-- fenetres parasites. Le mux local en est la victime designee — son serveur
+-- demarre pendant la restauration, et la fenetre qu'il ouvre alors est
+-- justement le « workspace non vide » sur lequel `reconcile_workspace` se
+-- rabat.
 --
--- La cible est donc resolue par `workspace_mux_windows`, cote mux, ou le nom du
--- workspace fait foi. On attend la fenetre ET son pane d'accueil : la fenetre
--- apparait avant que son spawn n'ait produit son pane.
-local function restore_layout_when_ready(window, workspace, attempts)
-  attempts = attempts or 0
+-- CE QU'ON FAIT A LA PLACE : creer la fenetre nous-memes cote mux, dans le
+-- workspace de PARKING, puis la RENOMMER vers sa cible.
+--
+-- Le renommage n'est pas cosmetique, c'est lui qui corrige le SERVEUR :
+-- `set_workspace` emet `WindowWorkspaceChanged`, que le client traduit en
+-- `SetWindowWorkspace` pour le mux-server. Passer directement
+-- `workspace = <cible>` au spawn ne corrigerait que le cote client — c'est le
+-- piege de 8a40e21, ou le serveur gardait l'etiquette du workspace actif et
+-- ressortait les panes dans le workspace courant au rattachement suivant. La
+-- fenetre doit donc NAITRE AILLEURS que dans sa cible pour qu'il y ait un
+-- renommage a notifier : `set_workspace` ne notifie rien quand le nom ne change
+-- pas. Le parking n'etant jamais l'actif, elle n'apparait a l'ecran a aucun
+-- moment de ce detour.
+--
+-- La bascule qui suit n'a alors plus rien a spawner : elle rejoint une fenetre
+-- qui existe deja, donc plus d'aller-retour asynchrone ou l'actif puisse
+-- deriver.
+-- ---------------------------------------------------------------------------
+local function spawn_workspace_window(name, spawn)
+  local options = merge_spawn_options({ workspace = parking_workspace }, spawn)
 
-  local host = nil
+  local ok, spawned_tab, spawned_pane, mux_window = pcall(function()
+    return wezterm.mux.spawn_window(options)
+  end)
 
-  for _, mux_window in ipairs(workspace_mux_windows(workspace.name)) do
-    local ok, host_pane = pcall(function()
-      return mux_window:active_pane()
-    end)
-
-    if ok and host_pane ~= nil then
-      host = mux_window
-      break
-    end
+  if not ok or not mux_window then
+    append_debug('spawn_window echec name=' .. tostring(name)
+      .. ' err=' .. tostring(spawned_tab))
+    return nil
   end
 
-  if host then
-    restore_layout_in_window(window, host, workspace)
-    wezterm.GLOBAL[build_flight_key(workspace.name)] = nil
-    return
+  local renamed, err = pcall(function()
+    mux_window:set_workspace(name)
+  end)
+
+  if not renamed then
+    append_debug('set_workspace echec name=' .. tostring(name) .. ' err=' .. tostring(err))
+    return nil
   end
 
-  if attempts >= 30 then
-    append_debug('restore layout gave up (aucune fenetre d accueil) name='
-      .. tostring(workspace.name))
-    wezterm.GLOBAL[build_flight_key(workspace.name)] = nil
-    return
-  end
+  append_debug('fenetre creee name=' .. tostring(name))
 
-  if wezterm.time and wezterm.time.call_after then
-    wezterm.time.call_after(0.1, function()
-      restore_layout_when_ready(window, workspace, attempts + 1)
-    end)
-  end
+  return mux_window, spawned_pane
 end
 
+-- Construit la fenetre du workspace, y pose la disposition, puis bascule dessus.
+-- `wezterm.mux.spawn_window` rend fenetre, onglet et pane immediatement : il n'y
+-- a plus rien a attendre ensuite — ni fenetre d'accueil a guetter, ni
+-- disposition posee en differe.
 local function restore_workspace_in_current_window(window, pane, workspace)
-  local first_tab = workspace.tabs[1]
-
   wezterm.GLOBAL[build_flight_key(workspace.name)] = os.time() + BUILD_FLIGHT_SECONDS
 
+  local mux_window = spawn_workspace_window(
+    workspace.name,
+    merge_spawn_options(
+      workspace_domain_spawn(workspace),
+      first_layout_spawn(workspace, 1, build_tab_layout(workspace.tabs[1]))
+    )
+  )
+
+  if not mux_window then
+    wezterm.GLOBAL[build_flight_key(workspace.name)] = nil
+    notify_error(window, 'Impossible d ouvrir le workspace: ' .. workspace.name)
+    return false
+  end
+
+  restore_layout_in_window(window, mux_window, workspace)
+  wezterm.GLOBAL[build_flight_key(workspace.name)] = nil
+
   window:perform_action(
-    wezterm.action.SwitchToWorkspace {
-      name = workspace.name,
-      spawn = merge_spawn_options(
-        workspace_domain_spawn(workspace),
-        first_layout_spawn(workspace, 1, build_tab_layout(first_tab))
-      ),
-    },
+    wezterm.action.SwitchToWorkspace { name = workspace.name },
     pane
   )
 
-  restore_layout_when_ready(window, workspace)
-  -- La disposition se pose en differe : on enregistre une fois qu'elle est la.
   save_soon(workspace.name)
 
   return true
 end
 
-local function restore_workspace(window, pane, workspace)
-  append_debug('restore start name=' .. tostring(workspace.name)
-    .. ' domain=' .. tostring(workspace.domain))
+-- Rythme d'attente du domaine (cf. `restore_workspace`). Six essais couvrent
+-- largement le demarrage d'un mux-server ; au-dela, le probleme n'est pas une
+-- question de patience.
+local ATTACH_RETRY_DELAY = 1.2
+local ATTACH_MAX_RETRIES = 6
 
-  -- Reconstruction deja en vol : on se contente de basculer dessus. En relancer
-  -- une par-dessus creerait un deuxieme jeu de fenetres.
+local function restore_workspace(window, pane, workspace, attempt)
+  attempt = attempt or 0
+
+  if attempt == 0 then
+    append_debug('restore start name=' .. tostring(workspace.name)
+      .. ' domain=' .. tostring(workspace.domain))
+  end
+
+  -- Reconstruction deja en vol : on la laisse finir, elle bascule elle-meme a la
+  -- fin. En relancer une par-dessus creerait un deuxieme jeu de fenetres, et
+  -- basculer tout de suite serait pire : la fenetre cible n'existe pas encore,
+  -- donc WezTerm en spawnerait une de son cru, sur le domaine de son choix.
   if build_in_flight(workspace.name) then
-    append_debug('restore deja en vol, simple bascule name=' .. tostring(workspace.name))
-    window:perform_action(
-      wezterm.action.SwitchToWorkspace { name = workspace.name },
-      pane
-    )
+    append_debug('restore deja en vol, on laisse finir name=' .. tostring(workspace.name))
     return
   end
 
-  -- Un domaine mux detache refuse tout spawn : le rattacher AVANT de restaurer,
-  -- sinon le workspace s'ouvre vide. Le premier workspace distant ouvert depuis
-  -- une session locale passe systematiquement par ici.
-  local attached, attach_err = domains.ensure_attached(workspace.domain)
+  -- Un domaine mux detache refuse tout spawn : il doit etre rattache AVANT de
+  -- restaurer, sinon le workspace s'ouvre vide. Mais rattacher est SYNCHRONE sur
+  -- le thread GUI : le faire ici, sous la frappe, c'est geler le terminal le
+  -- temps que le serveur reponde — et s'il n'est pas demarre, le temps qu'il
+  -- naisse. Mesure du 2026-08-20 : 4,4 s d'interface morte a la premiere
+  -- ouverture d'un workspace local.
+  --
+  -- On ne rattache donc jamais ici. Si le domaine n'est pas pret, on le prepare
+  -- et on repasse : le GUI reste vivant, l'utilisateur voit un message au lieu
+  -- d'un terminal fige, et le rattachement se fait en differe (`domains.preload`
+  -- sonde le distant avant de s'y connecter, et le mux local a ete demarre entre
+  -- temps). L'attente est bornee.
+  if not domains.is_attached(workspace.domain) then
+    if attempt >= ATTACH_MAX_RETRIES then
+      append_debug('restore attach abandon name=' .. tostring(workspace.name)
+        .. ' domain=' .. tostring(workspace.domain))
+      notify_error(window, 'Domaine ' .. domains.label(workspace.domain) .. ' injoignable: ' .. workspace.name)
+      return
+    end
 
-  if not attached then
-    append_debug('restore attach failed name=' .. tostring(workspace.name) .. ' err=' .. tostring(attach_err))
-    notify_error(window, 'Domaine ' .. domains.label(workspace.domain) .. ' injoignable: ' .. workspace.name)
+    if attempt == 0 then
+      if domains.is_local(workspace.domain) then
+        domains.start_local_mux()
+      end
+
+      notify(window, 'Domaine ' .. domains.label(workspace.domain) .. ': connexion...')
+    end
+
+    wezterm.time.call_after(ATTACH_RETRY_DELAY, function()
+      local ok, reason = domains.preload(workspace.domain)
+
+      if not ok then
+        append_debug('restore attente domaine=' .. tostring(workspace.domain)
+          .. ' (' .. tostring(reason) .. ')')
+      end
+
+      -- Le pane d'origine peut avoir disparu entre temps (overlay referme,
+      -- bascule) : on repart du pane actif de la fenetre.
+      local host_ok, host = pcall(function()
+        return window:active_pane()
+      end)
+
+      restore_workspace(window, (host_ok and host) or pane, workspace, attempt + 1)
+    end)
+
     return
   end
 
-  -- Le rattachement vient peut-etre d'importer la fenetre d'amorcage du serveur
-  -- dans le workspace courant : on l'ecarte avant de continuer.
   -- PAS de mode « nouvelle fenetre ». Invariant du depot : une seule fenetre
   -- ouverte a la fois. Un workspace s'ouvre la ou on est — WezTerm y revele la
   -- fenetre du workspace cible — jamais a cote.
@@ -1557,13 +1659,13 @@ local function restore_workspace(window, pane, workspace)
 
   if type(workspace.tabs) ~= 'table' or #workspace.tabs == 0 then
     append_debug('restore legacy workspace name=' .. tostring(workspace.name))
-    window:perform_action(
-      wezterm.action.SwitchToWorkspace {
-        name = workspace.name,
-        spawn = workspace_domain_spawn(workspace),
-      },
-      pane
-    )
+
+    if not spawn_workspace_window(workspace.name, workspace_domain_spawn(workspace)) then
+      notify_error(window, 'Impossible d ouvrir le workspace: ' .. workspace.name)
+      return
+    end
+
+    window:perform_action(wezterm.action.SwitchToWorkspace { name = workspace.name }, pane)
     return
   end
 
@@ -1607,10 +1709,15 @@ function M.prompt_new_workspace(window, pane)
             return
           end
 
-          w:perform_action(wezterm.action.SwitchToWorkspace {
-            name = line,
-            spawn = { domain = domains.spawn_domain(domain) },
-          }, sel_pane)
+          -- Meme chemin que la restauration, et pour la meme raison : le spawn
+          -- de `SwitchToWorkspace` deposerait la fenetre dans le workspace
+          -- ACTIF (cf. spawn_workspace_window).
+          if not spawn_workspace_window(line, { domain = domains.spawn_domain(domain) }) then
+            notify_error(w, 'Impossible de creer le workspace: ' .. line)
+            return
+          end
+
+          w:perform_action(wezterm.action.SwitchToWorkspace { name = line }, sel_pane)
 
           notify(w, 'Workspace ' .. line .. ' [' .. domains.label(domain) .. ']')
         end)
@@ -1957,7 +2064,7 @@ function M.restore_all_active(window, pane)
     return
   end
 
-  local restored, live, empty, unreachable = 0, 0, 0, 0
+  local restored, live, empty = 0, 0, 0
 
   for _, workspace in ipairs(workspaces) do
     if type(workspace.tabs) ~= 'table' or #workspace.tabs == 0 then
@@ -1966,13 +2073,11 @@ function M.restore_all_active(window, pane)
     elseif workspace_is_live(workspace.name) then
       append_debug('restore all skip (deja vivant) name=' .. tostring(workspace.name))
       live = live + 1
-    elseif not domains.ensure_attached(workspace.domain) then
-      -- Serveur eteint ou VPN coupe : les workspaces locaux doivent quand meme
-      -- se restaurer, donc on saute l'entree au lieu d'interrompre la boucle.
-      append_debug('restore all skip (domaine injoignable) name=' .. tostring(workspace.name)
-        .. ' domain=' .. tostring(workspace.domain))
-      unreachable = unreachable + 1
     else
+      -- Aucun test de domaine ici : c'est `restore_workspace` qui attend le
+      -- sien, en differe et sans geler. Sonder les domaines dans cette boucle
+      -- revenait a les sonder tous d'affilee, sous la frappe — un
+      -- aller-retour reseau par domaine avant la moindre ouverture.
       restore_workspace(window, pane, workspace)
       restored = restored + 1
     end
@@ -1986,10 +2091,6 @@ function M.restore_all_active(window, pane)
 
   if empty > 0 then
     table.insert(details, empty .. ' sans snapshot')
-  end
-
-  if unreachable > 0 then
-    table.insert(details, unreachable .. ' domaine injoignable')
   end
 
   local message = 'Workspaces restaures: ' .. restored .. '/' .. #workspaces

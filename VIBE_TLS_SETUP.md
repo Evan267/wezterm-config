@@ -82,6 +82,21 @@ Les chemins de la PKI sont construits dans `lua/domains.lua` à partir de
 
 1. S'assurer que `~/.wezterm.lua` déclare un `tls_servers` écoutant sur le port
    TLS et référençant `~/.wezterm-tls\server.crt` / `server.key` / `ca.pem`.
+1. *(recommandé)* Y garer la **fenêtre d'amorçage** du serveur. À son démarrage,
+   `wezterm-mux-server` ouvre une fenêtre s'il n'a aucun pane dans son domaine
+   par défaut ; sans workspace demandé, elle atterrit dans `default` et le
+   client la réimporte à **chaque** rattachement — une fenêtre parasite de plus
+   à chaque lancement du poste. Le même handler que dans `lua/domains.lua` de ce
+   dépôt la place dans le workspace de parking, que le client n'affiche jamais :
+   ```lua
+   wezterm.on('mux-startup', function()
+     pcall(function()
+       wezterm.mux.spawn_window { workspace = 'wezterm-amorcage' }
+     end)
+   end)
+   ```
+   Le nom doit rester celui du client (`domains.PARKING`). En cas d'échec, le
+   serveur retombe sur sa propre fenêtre : rien de cassé.
 2. Ouvrir le port TLS dans le pare-feu (une seule fois) :
    ```powershell
    New-NetFirewallRule -DisplayName "WezTerm mux TLS" -Direction Inbound `

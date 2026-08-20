@@ -38,19 +38,24 @@ c'était le risque permanent de `default_domain = localmux`. Contrepartie assum�
 les panes du workspace de passage `default` meurent avec la fenêtre.
 
 Les connexions dont les workspaces **actifs** ont besoin sont en revanche
-**préchargées** ~1 s après l'ouverture (`run_preload_once` → `domains.preload`),
-pour que leurs sessions soient déjà là au moment d'y basculer. Le préchargement
-**sonde avant de rattacher** : `domain:attach()` est synchrone et gèlerait le GUI
-le temps du timeout TCP. Le mux local n'est jamais *démarré* par le
-préchargement, seulement rejoint s'il tourne déjà.
+préparées au lancement (`run_preload_once`), en deux temps : le mux local est
+**démarré en tâche de fond à t+0** (`domains.start_local_mux`, via
+`background_child_process`, et seulement si un workspace actif y vit), puis les
+domaines sont **rattachés à t+2 s** (`domains.preload`, qui sonde le distant
+avant de s'y connecter). `domain:attach()` est synchrone sur le thread GUI :
+démarrer un mux-server au travers coûte ~4 s de gel, joindre un serveur
+injoignable ~12 s. **Rien de tout cela ne doit se produire sous une frappe** :
+`restore_workspace` ne fait que lire l'état du domaine (`domains.is_attached`)
+et se rappelle en différé s'il n'est pas prêt.
 
 **Le choix d'un serveur est une question de création de workspace, pas de
 lancement du terminal.** Il n'y a plus de sélecteur au démarrage : `ALT+n`
 demande le domaine du nouveau workspace (mux local ou `vibe` — jamais l'intégré,
 un workspace nommé doit survivre à la fermeture), et ce domaine est ensuite figé
 dans `workspaces.json` (champ `domain`, par workspace et par pane). `ALT+SHIFT+D`
-reste la bascule par fenêtre. `unix_domains` n'a pas `connect_automatically` : le
-mux local ne démarre qu'au premier spawn qui le vise.
+reste la bascule par fenêtre. `unix_domains` n'a pas `connect_automatically` :
+c'est nous qui démarrons le mux local, en tâche de fond au lancement (voir
+ci-dessus), et jamais « à la demande » — la demande tombe sous une frappe.
 
 Ne pas supprimer le domaine intégré `local` : c'est celui du démarrage. En
 revanche `workspaces.json` ne doit **jamais** le contenir : la capture

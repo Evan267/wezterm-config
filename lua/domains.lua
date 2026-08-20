@@ -17,6 +17,14 @@ M.LOCAL_MUX = 'localmux'
 -- Domaine mux TLS de la machine distante (cf. VIBE_TLS_SETUP.md).
 M.REMOTE = env.VIBE_DOMAIN
 
+-- Workspace de PARKING : il n'est jamais l'actif, donc le GUI ne l'affiche
+-- jamais, et il n'est jamais enregistre (cf. lua/workspaces.lua). C'est le
+-- garage des fenetres que personne n'a demandees : celle qu'un mux-server ouvre
+-- a son demarrage (cf. le handler `mux-startup` plus bas), et celle de tout
+-- workspace en cours de construction, avant son renommage (cf.
+-- `spawn_workspace_window` dans lua/workspaces.lua).
+M.PARKING = 'wezterm-amorcage'
+
 -- Domaines d'overlay (InputSelector, PromptInputLine) : jamais persistes dans
 -- workspaces.json ni proposes comme cible. Un pane d'overlay repond
 -- 'TermWizTerminalDomain' a get_domain_name(), ce qui polluerait les snapshots.
@@ -190,16 +198,53 @@ local function child_ok(argv)
   return ok and success == true
 end
 
--- Le mux LOCAL tourne-t-il deja ? On ne le DEMARRE pas au prechargement : un
--- mux-server qui demarre spawne sa propre fenetre (cf. plus haut), qui
--- apparaitrait alors dans le workspace de passage sans que personne ne l'ait
--- demandee. S'il n'est pas la, il n'y a simplement rien a precharger — le
--- premier workspace ouvert le demarrera.
-local function local_mux_running()
-  return child_ok {
-    'powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
-    'if (Get-Process wezterm-mux-server -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }',
-  }
+-- DEMARRAGE DU MUX LOCAL, EN TACHE DE FOND ET LE PLUS TOT POSSIBLE.
+--
+-- Avant, le prechargement refusait de le demarrer : un mux-server qui demarre
+-- ouvre sa propre fenetre, qui atterrissait dans le workspace de passage. Cette
+-- fenetre est desormais garee (cf. le handler `mux-startup`), donc l'objection
+-- est levee — et la laisser eteinte coutait bien plus cher que ce qu'elle
+-- evitait : la premiere ouverture d'un workspace local payait le demarrage du
+-- serveur SOUS LA FRAPPE, `domain:attach()` etant synchrone sur le thread GUI.
+-- Mesure du 2026-08-20 : 4,4 s d'interface entierement gelee (journal GUI,
+-- « Will try spawning the server » a 09:18:06, workspace ouvert a 09:18:09).
+--
+-- `background_child_process` ne rend PAS la main sur le process fils : rien
+-- n'est attendu, le GUI continue de tourner pendant que le serveur naît. C'est
+-- toute la difference avec `run_child_process` (utilise pour les sondes, qui
+-- doivent, elles, rendre un resultat).
+--
+-- Exactement la commande que WezTerm lance lui-meme dans ce cas, prise a cote du
+-- binaire courant plutot que dans le PATH.
+local START_REQUESTED = 'local_mux_start_requested'
+
+local function mux_server_path()
+  if M.is_windows() then
+    return wezterm.executable_dir .. '\\wezterm-mux-server.exe'
+  end
+
+  return wezterm.executable_dir .. '/wezterm-mux-server'
+end
+
+-- Une seule demande par process GUI : un deuxieme serveur ne pourrait de toute
+-- facon pas prendre le socket, il se contenterait de mourir en journalisant.
+-- Retourne true si la demande vient d'etre emise.
+function M.start_local_mux()
+  if wezterm.GLOBAL[START_REQUESTED] then
+    return false
+  end
+
+  wezterm.GLOBAL[START_REQUESTED] = true
+
+  local ok, err = pcall(function()
+    wezterm.background_child_process { mux_server_path(), '--daemonize' }
+  end)
+
+  if not ok then
+    wezterm.log_error('demarrage du mux local impossible: ' .. tostring(err))
+  end
+
+  return ok
 end
 
 -- Poignee de main TCP bornee a PROBE_TIMEOUT_MS, sans TLS : on ne cherche qu'a
@@ -214,8 +259,12 @@ local function remote_reachable()
 end
 
 -- Rattache le domaine SI c'est raisonnable, sans jamais risquer un gel : le
--- domaine integre n'a rien a rattacher, le mux local n'est rattache que s'il
--- tourne deja, le distant que s'il repond au probe. Retourne ok, raison.
+-- domaine integre n'a rien a rattacher, le distant n'est rattache que s'il
+-- repond au probe. Le mux local, lui, a ete demarre par `M.start_local_mux` —
+-- c'est la seule chose qui rendait son rattachement couteux.
+--
+-- SEUL POINT D'ENTREE ADMIS HORS DEMARRAGE : tout ce qui part d'une frappe passe
+-- par ici et jamais par `ensure_attached` en direct. Retourne ok, raison.
 function M.preload(name)
   name = M.normalize(name)
 
@@ -223,22 +272,16 @@ function M.preload(name)
     return true, 'rien a rattacher'
   end
 
-  if M.is_remote(name) then
-    if not remote_reachable() then
-      return false, 'injoignable (' .. env.VIBE_ADDR .. ':' .. env.VIBE_TLS_PORT .. ')'
-    end
-  elseif not local_mux_running() then
-    return false, 'mux local pas demarre'
+  if M.is_remote(name) and not remote_reachable() then
+    return false, 'injoignable (' .. env.VIBE_ADDR .. ':' .. env.VIBE_TLS_PORT .. ')'
   end
 
   return M.ensure_attached(name)
 end
 
--- Rattache le domaine si besoin. Indispensable avant tout spawn sur un domaine
--- mux, local comme distant : detache, il refuse le spawn. Seul le domaine
--- integre est toujours pret. Pour le mux local, attach() demarre le serveur au
--- besoin. Retourne ok, message d'erreur.
-function M.ensure_attached(name)
+-- « Ce domaine est-il deja utilisable ? » — lecture d'etat pure, qui ne rattache
+-- rien et ne peut donc rien geler. C'est ce qu'on interroge sous une frappe.
+function M.is_attached(name)
   name = M.normalize(name)
 
   if not name or name == M.LOCAL then
@@ -248,15 +291,38 @@ function M.ensure_attached(name)
   local found, domain = pcall(wezterm.mux.get_domain, name)
 
   if not found or not domain then
-    return false, 'domaine inconnu'
+    return false
   end
 
-  local state_ok, state = pcall(function()
+  local ok, state = pcall(function()
     return domain:state()
   end)
 
-  if state_ok and state == 'Attached' then
+  return ok and state == 'Attached'
+end
+
+-- Rattache le domaine si besoin. Indispensable avant tout spawn sur un domaine
+-- mux, local comme distant : detache, il refuse le spawn. Seul le domaine
+-- integre est toujours pret. Retourne ok, message d'erreur.
+--
+-- BLOQUANT : `domain:attach()` est synchrone sur le thread GUI, et il DEMARRE le
+-- serveur si besoin. Ne jamais l'appeler depuis un handler de touche — passer
+-- par `M.preload`, qui sonde d'abord, et le faire en differe.
+function M.ensure_attached(name)
+  name = M.normalize(name)
+
+  if not name or name == M.LOCAL then
     return true
+  end
+
+  if M.is_attached(name) then
+    return true
+  end
+
+  local found, domain = pcall(wezterm.mux.get_domain, name)
+
+  if not found or not domain then
+    return false, 'domaine inconnu'
   end
 
   local attached, err = pcall(function()
@@ -354,6 +420,44 @@ function M.prompt_switch_default(window, pane)
   end)
 end
 
+-- LA FENETRE D'AMORCAGE DU MUX-SERVER, GAREE PLUTOT QUE SUBIE.
+--
+-- `wezterm-mux-server` ouvre une fenetre a son demarrage SI aucun pane ne vit
+-- deja dans son domaine par defaut (wezterm-mux-server/src/main.rs). Cette
+-- fenetre-la ne demande aucun workspace : elle atterrit dans `default`, et le
+-- GUI la reimporte a CHAQUE rattachement. C'est une fenetre parasite de plus a
+-- chaque demarrage du mux local, et un « workspace non vide » tout trouve pour
+-- le repli de `reconcile_workspace` (cf. `spawn_workspace_window` dans
+-- lua/workspaces.lua, qui detaille les degats).
+--
+-- On ne peut pas empecher cette fenetre — le serveur veut un pane — mais on
+-- peut la CHOISIR : creer nous-memes ce premier pane, dans le workspace de
+-- parking, suffit a ce que le serveur n'en cree pas d'autre. Elle existe donc
+-- toujours, mais dans un workspace que le client n'affiche jamais.
+--
+-- Une tentative precedente balayait les fenetres importees pour les deloger
+-- apres coup, toutes les 0,5 s, en lisant le repertoire de chaque pane : elle a
+-- fige le GUI (cf. e5060dc). Ici il n'y a ni balayage, ni timer, ni lecture de
+-- pane — une seule creation, au demarrage du serveur.
+--
+-- `mux-startup` n'est emis QUE par wezterm-mux-server : cote GUI ce handler ne
+-- se declenche jamais. Il est enregistre a l'evaluation du module, comme les
+-- autres handlers du depot (cf. lua/workspaces.lua) : WezTerm vide sa table de
+-- handlers a chaque rechargement de config, un garde-fou dans `wezterm.GLOBAL`
+-- empecherait de la reconstruire.
+--
+-- En cas d'echec, le serveur retombe sur sa propre fenetre : on est au pire dans
+-- l'etat d'avant.
+wezterm.on('mux-startup', function()
+  local ok, err = pcall(function()
+    wezterm.mux.spawn_window { workspace = M.PARKING }
+  end)
+
+  if not ok then
+    wezterm.log_error('mux-startup: fenetre d amorcage non garee: ' .. tostring(err))
+  end
+end)
+
 -- AUCUN handler `gui-startup` ici, et c'est DELIBERE : sa seule presence inhibe
 -- la creation de la fenetre par defaut de WezTerm, qu'il faudrait alors spawner
 -- soi-meme. Sans handler, WezTerm ouvre sa fenetre sur `default_domain`, donc
@@ -414,8 +518,10 @@ function M.apply(config)
   --
   -- Un domaine mux n'entre en jeu qu'a la CREATION d'un workspace (ALT+n, qui
   -- demande lequel) ou a l'ouverture d'un workspace enregistre, qui porte son
-  -- domaine. `unix_domains` n'a pas `connect_automatically` : le mux local n'est
-  -- demarre qu'a la demande, au premier spawn qui le vise.
+  -- domaine. `unix_domains` n'a pas `connect_automatically` : c'est NOUS qui
+  -- demarrons le mux local, en tache de fond au lancement et seulement si un
+  -- workspace actif en a besoin (cf. `M.start_local_mux`). Le laisser demarrer
+  -- « a la demande » revenait a le demarrer sous la frappe, donc a geler le GUI.
   --
   -- Contrepartie assumee : les panes du workspace de passage `default` vivent
   -- dans le process GUI et meurent avec lui. C'est le prix d'un demarrage qui ne
