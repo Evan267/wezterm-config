@@ -359,6 +359,29 @@ Points de maintenance :
   `lua/options.lua`). Chaque rechargement de config reevalue les modules ; un
   `wezterm.on` sans garde-fou empile un handler de plus a chaque fois, et sur ce
   depot les rechargements sont frequents (toute ecriture dans `config_dir`).
+- **ARCHIVER FERME LA SESSION VIVANTE.** Le marqueur `archived_at` ne suffit
+  pas : sans fermeture, les panes du workspace continuent de tourner sur leur
+  mux-server pour toujours. Celui de vibe est relance par tache planifiee, pas
+  par une session — ses fenetres survivent donc aux deconnexions et aux
+  redemarrages du poste, et personne ne les rattachera jamais plus. Constate le
+  2026-08-20 : `kubernetes` et `tme`, archives le 2026-08-18, avaient encore
+  leur fenetre et leur pane deux jours apres.
+  L'ordre compte : **capturer, partir, marquer, puis fermer**. Fermer avant de
+  capturer ne laisserait qu'un instantane vide a desarchiver ; fermer sans etre
+  parti, quand on archive le workspace COURANT, revient a fermer ses panes sous
+  ses propres pieds — la fenetre reste sur un workspace vide et WezTerm choisit
+  seul la suite, parking compris. `leave_archived_workspace` va donc au suivant
+  dans l'ordre du registre, via `restore_workspace` comme `activate_relative`
+  (un workspace eteint se rouvre depuis son snapshot, il ne suffit pas de le
+  designer actif), et retombe sur le workspace de passage s'il n'y a pas d'autre
+  workspace actif. Il doit etre appele AVANT `set_workspace_archived` : le calcul
+  du suivant part de la liste des actifs, ou celui qu'on archive doit encore
+  figurer.
+  La fermeture passe par `exit` envoye au shell (`exit_behavior = 'Close'` fait
+  le reste) : `Pane` n'expose ni `kill` ni `close`, verifie dans la doc de
+  20240203. Elle ne vise QUE les panes dont le premier plan est un shell — un
+  pane ou tourne un serveur ou un build recevrait `exit` comme une frappe
+  quelconque. Les autres sont comptes et annonces, jamais passes sous silence.
 - **Rattachement** (`ensure_attached`) : un domaine mux **detache refuse tout
   spawn**. Toute restauration ou creation sur un domaine mux — `localmux`
   compris, seul `local` est exempt — doit donc etre rattachee AVANT de spawner,

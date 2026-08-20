@@ -566,6 +566,7 @@ local function set_workspace_archived(name, archived)
   return save_registry(registry)
 end
 
+
 -- REFUS D'ECRASER UN ENREGISTREMENT PAR LE CONTENU D'UN AUTRE WORKSPACE.
 --
 -- WezTerm peut etiqueter une fenetre avec un workspace qui n'est pas le sien
@@ -1297,7 +1298,7 @@ end
 -- dans un mux supposerait en plus d'y etre deja rattache — ce qu'on est
 -- justement en train de faire.
 local function hidden_host_window()
-  local ok, _, _, mux_window = pcall(function()
+  local ok, _, pane, mux_window = pcall(function()
     return wezterm.mux.spawn_window {
       workspace = parking_workspace,
       domain = { DomainName = domains.LOCAL },
@@ -1309,7 +1310,31 @@ local function hidden_host_window()
     return nil
   end
 
-  return mux_window
+  return mux_window, pane
+end
+
+-- LA RENDRE DES QUE LES RATTACHEMENTS SONT FAITS.
+--
+-- Une fenetre de plus dans le mux du GUI, c'est une fenetre de plus a fermer
+-- avant qu'il ne quitte : `quit_when_all_windows_are_closed` (vrai par defaut)
+-- les compte TOUTES, y compris celles qu'on n'affiche pas. La garder ouverte
+-- garantirait qu'aucune fermeture de fenetre ne termine jamais le process — le
+-- GUI resterait vivant, invisible, en s'accumulant a chaque lancement.
+--
+-- `exit` au shell qu'on a spawne nous-memes, donc sans le garde-fou de
+-- `close_workspace_session` : on sait ce qui y tourne. Les onglets de
+-- ConnectionUI encore presents dans cette fenetre ne sont pas notre affaire —
+-- la connexion est etablie, ils se ferment d'eux-memes, et ils sont invisibles.
+local function release_hidden_host(host_pane)
+  if not host_pane then
+    return
+  end
+
+  local ok = pcall(function()
+    host_pane:send_text('exit\r')
+  end)
+
+  append_debug('fenetre hote invisible liberee ok=' .. tostring(ok))
 end
 
 
@@ -1635,7 +1660,7 @@ local function run_preload_once(gui_window)
   -- Repli sur la fenetre du GUI si le parking echoue : mieux vaut un
   -- clignotement contenu dans la fenetre courante qu'une fenetre `wezterm:
   -- Connecting...` qui surgit a cote (cf. `attach_host` dans lua/domains.lua).
-  local host_window = hidden_host_window()
+  local host_window, host_pane = hidden_host_window()
 
   if not host_window then
     local host_ok, gui_host = pcall(function()
@@ -1680,6 +1705,7 @@ local function run_preload_once(gui_window)
     -- L'ecran se ferme QUOI QU'IL ARRIVE : le laisser ouvert sur une erreur
     -- enfermerait l'utilisateur dans un pane qui dort une heure.
     close_waiting_screen(gui_window, waiting)
+    release_hidden_host(host_pane)
 
     if not ok then
       append_debug('prechargement erreur: ' .. tostring(ready))
@@ -2385,6 +2411,123 @@ function M.choose_delete_registered(window, pane)
   )
 end
 
+-- ---------------------------------------------------------------------------
+-- ARCHIVER FERME LA SESSION VIVANTE
+--
+-- L'archivage n'ecrivait que le registre : les panes du workspace continuaient
+-- de tourner sur leur mux-server, indefiniment et sans que rien ne les rattache
+-- plus jamais a quoi que ce soit. Constate le 2026-08-20 sur vibe : `kubernetes`
+-- (archive le 2026-08-18 a 10:06) et `tme` (le meme jour a 13:40) avaient encore
+-- leur fenetre et leur pane deux jours apres. Rien ne les aurait fermes — le
+-- mux-server de vibe est relance par tache planifiee, pas par une session, donc
+-- ses fenetres survivent aux deconnexions comme aux redemarrages du poste.
+--
+-- On envoie `exit` au shell de chaque pane : avec `exit_behavior = 'Close'`, le
+-- pane se ferme, donc l'onglet, donc la fenetre. `Pane` n'expose ni `kill` ni
+-- `close` (liste des methodes verifiee dans la doc de 20240203), et c'est deja
+-- la voie retenue par 3003ca2 pour exactement cette raison.
+--
+-- SEULEMENT AUX PANES DONT LE PREMIER PLAN EST UN SHELL. Un pane ou tourne un
+-- serveur, un build ou un editeur recevrait `exit` comme une frappe quelconque :
+-- sans effet dans le meilleur cas, dans le mauvais contexte sinon. Ceux-la sont
+-- laisses en place et comptes, pour que l'appelant puisse le DIRE plutot que de
+-- laisser croire a un menage complet.
+--
+-- Rend fermes, conserves.
+local function close_workspace_session(name)
+  local closed, kept = 0, 0
+
+  for _, mux_window in ipairs(workspace_mux_windows(name)) do
+    for _, tab in ipairs(mux_window_tabs(mux_window)) do
+      local ok, panes = pcall(function()
+        return tab:panes()
+      end)
+
+      if ok and type(panes) == 'table' then
+        for _, pane in ipairs(panes) do
+          local sent = false
+
+          if is_shell(pane_process_argv(pane)) then
+            sent = pcall(function()
+              pane:send_text('exit\r')
+            end)
+          end
+
+          if sent then
+            closed = closed + 1
+          else
+            kept = kept + 1
+          end
+        end
+      end
+    end
+  end
+
+  append_debug('session fermee name=' .. tostring(name)
+    .. ' fermes=' .. tostring(closed) .. ' conserves=' .. tostring(kept))
+
+  return closed, kept
+end
+
+-- SORTIR DU WORKSPACE QU'ON ARCHIVE, AVANT DE FERMER SA SESSION.
+--
+-- Archiver ferme desormais les panes du workspace. Si c'est celui ou l'on se
+-- trouve, on les ferme sous ses propres pieds : la fenetre resterait sur un
+-- workspace vide, et c'est WezTerm qui deciderait seul de la suite — le premier
+-- workspace venu, parking compris.
+--
+-- On part donc vers le SUIVANT, dans l'ordre du registre et par `restore_
+-- workspace`, exactement comme `activate_relative` : un workspace eteint doit
+-- etre rouvert depuis son snapshot, pas seulement designe comme actif.
+--
+-- A APPELER AVANT `set_workspace_archived` : le calcul du suivant part de la
+-- liste des workspaces ACTIFS, dans laquelle celui qu'on archive doit encore
+-- figurer pour qu'on sache d'ou l'on part.
+--
+-- Sans autre workspace actif, repli sur le workspace de passage : il ne persiste
+-- rien, mais il existe toujours et vit sur le domaine integre, donc il ne peut
+-- pas etre injoignable.
+local function leave_archived_workspace(window, name)
+  local pane_ok, pane = pcall(function()
+    return window:active_pane()
+  end)
+
+  pane = pane_ok and pane or nil
+
+  local workspaces = list_workspaces(load_registry(), 'active')
+  local _, index = find_workspace({ workspaces = workspaces }, name)
+  local target = nil
+
+  if index then
+    for step = 1, #workspaces - 1 do
+      local candidate = workspaces[((index - 1 + step) % #workspaces) + 1]
+
+      if candidate.name ~= name then
+        target = candidate
+        break
+      end
+    end
+  end
+
+  if target then
+    append_debug('archive depart name=' .. tostring(name) .. ' vers=' .. tostring(target.name))
+    restore_workspace(window, pane, target)
+    return target.name
+  end
+
+  append_debug('archive depart name=' .. tostring(name)
+    .. ' vers=' .. scratch_workspace .. ' (aucun autre workspace actif)')
+
+  pcall(function()
+    window:perform_action(
+      wezterm.action.SwitchToWorkspace { name = scratch_workspace },
+      pane
+    )
+  end)
+
+  return scratch_workspace
+end
+
 function M.choose_archive(window, pane)
   local registry = load_registry()
   local choices = {}
@@ -2413,13 +2556,47 @@ function M.choose_archive(window, pane)
           return
         end
 
+        -- CAPTURER AVANT DE FERMER. Desarchiver doit rouvrir le workspace tel
+        -- qu'il etait ; fermer d'abord ne laisserait qu'un instantane vide a
+        -- restaurer. `capture_workspace_now` n'ecrit rien si la capture est
+        -- vide (`snapshot_has_content`), donc un workspace deja eteint garde
+        -- l'enregistrement qu'il avait.
+        -- Le depart se decide AVANT tout le reste, tant que le workspace
+        -- courant est encore celui qu'on archive.
+        local leaving = canonical_workspace_name(workspace_name(win)) == name
+        local moved_to = nil
+
         local ok, done = pcall(function()
+          capture_workspace_now(name)
+
+          if leaving then
+            moved_to = leave_archived_workspace(win, name)
+          end
+
           return set_workspace_archived(name, true)
         end)
 
         if ok and done then
-          append_debug('archive workspace name=' .. tostring(name))
-          notify(win, 'Workspace archive: ' .. name)
+          local closed, kept = close_workspace_session(name)
+          local message = 'Workspace archive: ' .. name
+
+          if moved_to then
+            message = message .. ' -> ' .. moved_to
+          end
+
+          if closed > 0 or kept > 0 then
+            message = message .. ' (' .. closed .. ' panes fermes'
+
+            if kept > 0 then
+              message = message .. ', ' .. kept .. ' laisses, quelque chose y tourne'
+            end
+
+            message = message .. ')'
+          end
+
+          append_debug('archive workspace name=' .. tostring(name)
+            .. ' fermes=' .. tostring(closed) .. ' conserves=' .. tostring(kept))
+          notify(win, message)
         else
           append_debug('archive failed name=' .. tostring(name) .. ' err=' .. tostring(done))
           notify_error(win, 'Impossible d archiver: ' .. name)
