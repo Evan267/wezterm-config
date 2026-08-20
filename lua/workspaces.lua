@@ -1197,7 +1197,18 @@ end)
 -- eteint, donc le demarrer au passage) qu'on gelait 4,4 s d'interface, et sous
 -- la frappe qui ouvrait le workspace plutot qu'au lancement.
 local preload_flag = 'workspace_preload_done'
-local preload_delay = 2
+
+-- DELAI AVANT RATTACHEMENT, ADAPTE AU CAS.
+--
+-- Les 2 s ne servaient qu'a couvrir le demarrage d'un mux-server lance en tache
+-- de fond : rattacher un serveur qui NAIT est cher, rattacher un serveur qui
+-- TOURNE ne l'est pas. Depuis que le mux local survit aux relances du GUI
+-- (garde-fou de `start_local_mux`), le cas courant n'a plus rien a demarrer, et
+-- ces 2 s ne sont plus qu'un trou : la fenetre a l'air utilisable, puis la
+-- progression de connexion la prend d'un coup. On ne les paie donc que quand on
+-- vient reellement de lancer un serveur.
+local preload_delay_cold = 2
+local preload_delay_warm = 0.2
 
 -- Domaines effectivement utilises par les workspaces actifs, sans doublon.
 local function active_domains()
@@ -1212,18 +1223,399 @@ local function active_domains()
     end
   end
 
+  -- LOCAL D'ABORD. Le rattachement du mux local est instantane et sans sonde :
+  -- sa modale de connexion s'affiche donc tout de suite. Le distant, lui,
+  -- commence par une sonde TCP synchrone (jusqu'a 800 ms de thread GUI bloque,
+  -- rien a l'ecran) : le passer en premier laisserait ce blanc AVANT la premiere
+  -- modale, pile au moment ou l'utilisateur attend un signe. L'ordre du
+  -- registre, lui, n'a aucun sens ici.
+  table.sort(ordered, function(a, b)
+    local a_rank = domains.is_local(a) and 0 or 1
+    local b_rank = domains.is_local(b) and 0 or 1
+
+    if a_rank ~= b_rank then
+      return a_rank < b_rank
+    end
+
+    return a < b
+  end)
+
   return ordered
 end
 
-local function preload_domains(wanted)
+-- Rattache chaque domaine et rend le bilan en NOMS de domaine : l'appelant doit
+-- pouvoir les reinterroger (`domains.is_attached`), pas seulement les afficher.
+local function preload_domains(wanted, host_window)
+  local ready, failed = {}, {}
+
   for _, domain in ipairs(wanted) do
-    local ok, reason = domains.preload(domain)
+    local ok, reason = domains.preload(domain, host_window)
     append_debug('prechargement domaine=' .. domain
       .. ' ok=' .. tostring(ok) .. ' (' .. tostring(reason) .. ')')
+    table.insert(ok and ready or failed, domain)
+  end
+
+  return ready, failed
+end
+
+local function domain_labels(names)
+  local labels = {}
+
+  for _, name in ipairs(names) do
+    table.insert(labels, domains.label(name))
+  end
+
+  return labels
+end
+
+-- MESSAGE D'ATTENTE, POSE DES t+0 ET NON JUSTE AVANT LE RATTACHEMENT.
+--
+-- Le rattachement est SYNCHRONE sur le thread GUI : une notification posee juste
+-- avant ne serait peinte qu'une fois le rattachement fini, donc jamais pendant
+-- l'attente qu'elle est censee couvrir. On la pose donc a t+0, pendant les 2 s
+-- ou le GUI tourne encore, avec une duree qui couvre l'attente ET la poignee de
+-- main. Meme raisonnement que le « Domaine X: connexion... » de
+-- `restore_workspace`.
+-- ---------------------------------------------------------------------------
+-- FENETRE HOTE INVISIBLE POUR LA PROGRESSION DE CONNEXION
+--
+-- La ConnectionUI de WezTerm n'est pas optionnelle : `ConnectionUI::with_params`
+-- lance `termwiztermtab::run` DES SA CONSTRUCTION (source de 20240203,
+-- `mux/src/connui.rs`), et le seul constructeur muet, `new_headless()`, n'est
+-- pas atteignable depuis `Domain::attach`. Un rattachement = une UI, donc deux
+-- domaines = deux clignotements. Aucun reglage n'y change rien.
+--
+-- On ne peut donc pas la supprimer, mais on peut CHOISIR OU ELLE NAIT : le
+-- `window_id` qu'on passe a `attach` est celui de la fenetre qui l'accueille.
+-- Une fenetre du workspace de PARKING fait l'affaire — il n'est jamais l'actif,
+-- donc le GUI ne l'affiche a aucun moment (meme propriete que celle exploitee
+-- par `spawn_workspace_window`). L'UI naît dedans, vit dedans, et personne ne
+-- la voit.
+--
+-- Sur le domaine INTEGRE : la fenetre vit alors dans le process GUI et meurt
+-- avec lui, donc rien ne s'accumule d'une session a l'autre. La faire naitre
+-- dans un mux supposerait en plus d'y etre deja rattache — ce qu'on est
+-- justement en train de faire.
+local function hidden_host_window()
+  local ok, _, _, mux_window = pcall(function()
+    return wezterm.mux.spawn_window {
+      workspace = parking_workspace,
+      domain = { DomainName = domains.LOCAL },
+    }
+  end)
+
+  if not ok or not mux_window then
+    append_debug('fenetre hote invisible impossible: ' .. tostring(mux_window))
+    return nil
+  end
+
+  return mux_window
+end
+
+
+-- ---------------------------------------------------------------------------
+-- ECRAN DE CONNEXION : UN SEUL, LE NOTRE
+--
+-- Les ConnectionUI de WezTerm etant renvoyees dans le parking (cf.
+-- `hidden_host_window`), plus rien ne s'affiche de lui-meme pendant le
+-- prechargement. On peut donc montrer UN ecran, du debut a la fin, au lieu de
+-- subir une UI par domaine entrecoupee de retours au terminal.
+--
+-- C'est un pane, pas une modale : WezTerm n'expose aucune surface flottante au
+-- Lua, et sa propre « modale » de connexion n'en est pas une non plus — c'est un
+-- `termwiztermtab`, donc deja un onglet. On fait la meme chose que lui, mais une
+-- fois et sous notre controle.
+--
+-- Sur le domaine INTEGRE, pour trois raisons convergentes : c'est le seul
+-- domaine qui ne peut pas etre injoignable ; son spawn est instantane, la ou
+-- passer par un mux-server ferait payer, pour afficher un ecran d'attente,
+-- exactement l'attente qu'il annonce ; et `inject_output` ne marche QUE sur les
+-- panes locaux (doc : « works for local panes but not for multiplexer panes »),
+-- or c'est lui qui dessine l'animation.
+local WAITING_TAB_TITLE = 'Connexion'
+local WAITING_SLEEP_SECONDS = '3600'
+local WAITING_FRAME_SECONDS = 0.12
+local WAITING_SPINNER = { '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏' }
+local WAITING_TITLE = 'Connexion aux domaines'
+local WAITING_HINT = 'preparation en cours'
+-- Marge INTERNE de la boite, en colonnes ; le reste de la geometrie se deduit du
+-- contenu et de la taille du pane.
+local WAITING_PAD = 3
+local WAITING_BOX_ROWS = 7
+-- Colonnes occupees par le glyphe du spinner et les deux espaces qui le suivent,
+-- au debut de la ligne d'animation.
+local WAITING_SPINNER_COLS = 3
+
+local ESC = string.char(27)
+local STYLE_RESET = ESC .. '[0m'
+local STYLE_BOLD = ESC .. '[1m'
+local STYLE_UNBOLD = ESC .. '[22m'
+local HIDE_CURSOR = ESC .. '[?25l'
+local CLEAR_SCREEN = ESC .. '[2J'
+
+local function sgr(layer, rgb)
+  return ESC .. '[' .. layer .. ';2;' .. rgb .. 'm'
+end
+
+local function bg(rgb) return sgr(48, rgb) end
+local function fg(rgb) return sgr(38, rgb) end
+
+local function move_to(row, col)
+  return ESC .. '[' .. tostring(row) .. ';' .. tostring(col) .. 'H'
+end
+
+-- Palette alignee sur celle de lua/status.lua (Catppuccin Mocha / Latte), en RGB
+-- direct : cet ecran ne doit rien devoir a la palette ANSI du theme courant,
+-- dont les seize couleurs changent d'un scheme a l'autre.
+--
+-- `base` est le fond du pane et `surface` celui de la boite : c'est ce decalage
+-- qui donne le ton different du reste — la boite se detache du fond, et le fond
+-- se detache du terminal habituel.
+local function waiting_theme()
+  local scheme = wezterm.GLOBAL.dynamic_color_scheme or ''
+
+  if scheme:find('Latte') or scheme:find('Light') then
+    return {
+      base = '230;233;239',
+      surface = '204;208;218',
+      text = '76;79;105',
+      accent = '30;102;245',
+      muted = '124;127;147',
+    }
+  end
+
+  return {
+    base = '24;24;37',
+    surface = '49;50;68',
+    text = '205;214;244',
+    accent = '137;180;250',
+    muted = '147;153;178',
+  }
+end
+
+local function pane_size(pane)
+  local ok, dims = pcall(function()
+    return pane:get_dimensions()
+  end)
+
+  if not ok or type(dims) ~= 'table' then
+    return 80, 24
+  end
+
+  return dims.cols or 80, dims.viewport_rows or 24
+end
+
+-- TOUT LE TEXTE DESSINE EST EN ASCII, sciemment : `#s` compte des OCTETS et non
+-- des colonnes, et c'est cette longueur qui centre la boite. Les seuls
+-- caracteres non-ASCII sont les bordures et le glyphe du spinner, dont les
+-- largeurs sont donc comptees a la main (une colonne chacun). Ajouter un accent
+-- a un titre decalerait tout le bord droit.
+local function waiting_geometry(waiting)
+  local cols, rows = pane_size(waiting.pane)
+  local labels = table.concat(waiting.labels, ', ')
+
+  local widest = #WAITING_TITLE
+
+  if #labels > widest then
+    widest = #labels
+  end
+
+  local spinner_line = WAITING_SPINNER_COLS + #WAITING_HINT
+
+  if spinner_line > widest then
+    widest = spinner_line
+  end
+
+  local inner = widest + WAITING_PAD * 2
+  local max_inner = math.max(12, cols - 4)
+
+  if inner > max_inner then
+    inner = max_inner
+  end
+
+  return {
+    cols = cols,
+    rows = rows,
+    inner = inner,
+    left = math.max(1, math.floor((cols - (inner + 2)) / 2) + 1),
+    top = math.max(1, math.floor((rows - WAITING_BOX_ROWS) / 2) + 1),
+    labels = labels,
+  }
+end
+
+-- Une ligne de contenu : bord, marge, texte, remplissage jusqu'au bord oppose.
+-- Le remplissage est indispensable — sans lui le fond de la boite s'arrete au
+-- dernier caractere et le bord droit flotte.
+--
+-- `style` est emis AVANT le texte et annule apres, mais n'entre pas dans le
+-- calcul de largeur : une sequence d'echappement n'occupe aucune colonne. C'est
+-- exactement pour ca qu'elle ne peut pas etre concatenee au texte par
+-- l'appelant.
+local function waiting_row(theme, geo, text, text_fg, style)
+  local fill = geo.inner - WAITING_PAD - #text
+
+  if fill < 0 then
+    text = text:sub(1, math.max(0, #text + fill))
+    fill = 0
+  end
+
+  return bg(theme.surface) .. fg(theme.muted) .. '│'
+    .. fg(text_fg) .. (style or '')
+    .. string.rep(' ', WAITING_PAD) .. text .. (style and STYLE_UNBOLD or '')
+    .. string.rep(' ', fill)
+    .. fg(theme.muted) .. '│'
+end
+
+local function paint_waiting(waiting)
+  local theme = waiting.theme
+  local geo = waiting_geometry(waiting)
+  waiting.geometry = geo
+
+  local edge = bg(theme.surface) .. fg(theme.muted)
+  local rule = string.rep('─', geo.inner)
+  local blank = waiting_row(theme, geo, '', theme.text)
+
+  local out = {
+    HIDE_CURSOR,
+    bg(theme.base),
+    CLEAR_SCREEN,
+    move_to(geo.top, geo.left), edge .. '╭' .. rule .. '╮',
+    move_to(geo.top + 1, geo.left), blank,
+    move_to(geo.top + 2, geo.left), waiting_row(theme, geo, WAITING_TITLE, theme.text, STYLE_BOLD),
+    move_to(geo.top + 3, geo.left), waiting_row(theme, geo, geo.labels, theme.muted),
+    move_to(geo.top + 4, geo.left), blank,
+    -- Les trois premieres colonnes sont laissees vides : c'est l'animation qui
+    -- y ecrit le glyphe, sans repeindre la ligne.
+    move_to(geo.top + 5, geo.left),
+    waiting_row(theme, geo, string.rep(' ', WAITING_SPINNER_COLS) .. WAITING_HINT, theme.muted),
+    move_to(geo.top + 6, geo.left), edge .. '╰' .. rule .. '╯',
+    STYLE_RESET,
+  }
+
+  pcall(function()
+    waiting.pane:inject_output(table.concat(out))
+  end)
+end
+
+-- Redessine le seul glyphe du spinner, a sa place. Repeint tout si le pane a
+-- change de taille : c'est ce qui garde la boite centree apres un
+-- redimensionnement. S'arrete de lui-meme des que l'ecran est ferme — le drapeau
+-- est lu a chaque image, il n'y a aucun timer a annuler.
+local function animate_waiting(waiting, frame)
+  if not waiting.open then
+    return
+  end
+
+  local cols, rows = pane_size(waiting.pane)
+  local geo = waiting.geometry
+
+  -- Les trois premieres images repeignent, en plus du cas du
+  -- redimensionnement : un pane fraichement spawne peut n'etre pas encore pret
+  -- a recevoir `inject_output`, et la peinture initiale se perdrait alors sans
+  -- que rien ne la rejoue.
+  if not geo or geo.cols ~= cols or geo.rows ~= rows or frame < 3 then
+    paint_waiting(waiting)
+    geo = waiting.geometry
+  end
+
+  local glyph = WAITING_SPINNER[(frame % #WAITING_SPINNER) + 1]
+
+  pcall(function()
+    waiting.pane:inject_output(
+      move_to(geo.top + 5, geo.left + 1 + WAITING_PAD)
+        .. bg(waiting.theme.surface) .. fg(waiting.theme.accent) .. glyph .. STYLE_RESET
+    )
+  end)
+
+  wezterm.time.call_after(WAITING_FRAME_SECONDS, function()
+    animate_waiting(waiting, frame + 1)
+  end)
+end
+
+-- Retourne la table d'ecran, ou nil. Tout est en pcall : un ecran de connexion
+-- qui echoue ne doit jamais empecher le prechargement lui-meme.
+local function open_waiting_screen(mux_window, labels)
+  local shell = domains.local_shell_prog()
+
+  if not mux_window or not shell then
+    return nil
+  end
+
+  local previous_ok, previous = pcall(function()
+    return mux_window:active_tab()
+  end)
+
+  local ok, tab, pane = pcall(function()
+    return mux_window:spawn_tab {
+      domain = { DomainName = domains.LOCAL },
+      args = { shell, '-NoProfile', '-NoLogo', '-Command', 'Start-Sleep -Seconds ' .. WAITING_SLEEP_SECONDS },
+    }
+  end)
+
+  if not ok or not tab or not pane then
+    append_debug('ecran de connexion impossible: ' .. tostring(tab))
+    return nil
+  end
+
+  local waiting = {
+    tab = tab,
+    pane = pane,
+    previous = previous_ok and previous or nil,
+    labels = labels,
+    theme = waiting_theme(),
+    open = true,
+  }
+
+  set_tab_title(tab, WAITING_TAB_TITLE)
+
+  pcall(function()
+    tab:activate()
+  end)
+
+  paint_waiting(waiting)
+  animate_waiting(waiting, 0)
+
+  return waiting
+end
+
+-- Le programme de ce pane ne fait que dormir : c'est NOUS qui le fermons.
+-- `MuxWindow` et `MuxTab` n'exposent ni close ni kill (verifie dans le binaire,
+-- cf. 3003ca2) ; l'action GUI, elle, ne demande qu'une GuiWindow. On vise
+-- `CloseCurrentPane` sur CE pane, et non `CloseCurrentTab` qui fermerait
+-- l'onglet actif du moment — celui de l'utilisateur s'il a bascule entre temps.
+local function close_waiting_screen(gui_window, waiting)
+  if not waiting or not waiting.open then
+    return
+  end
+
+  waiting.open = false
+
+  local ok, err = pcall(function()
+    gui_window:perform_action(
+      wezterm.action.CloseCurrentPane { confirm = false },
+      waiting.pane
+    )
+  end)
+
+  if not ok then
+    append_debug('fermeture ecran de connexion: ' .. tostring(err))
+  end
+
+  -- WezTerm active un onglet voisin apres la fermeture ; on revient
+  -- explicitement sur celui d'ou l'on vient plutot que de dependre de ce choix.
+  if waiting.previous then
+    pcall(function()
+      waiting.previous:activate()
+    end)
   end
 end
 
-local function run_preload_once()
+-- `gui_window` : la fenetre GUI du tick `update-status`. Elle sert deux fois —
+-- comme support des notifications, et, via `mux_window()`, comme hote de la
+-- progression de connexion de WezTerm (cf. `attach_host` dans lua/domains.lua ;
+-- sans elle il ouvre une fenetre `wezterm: Connecting...`). Capturee ici, a t+0,
+-- et servie au rattachement de t+2 s.
+local function run_preload_once(gui_window)
   if wezterm.GLOBAL[preload_flag] then
     return
   end
@@ -1236,19 +1628,66 @@ local function run_preload_once()
 
   local wanted = active_domains()
 
+  if #wanted == 0 then
+    return
+  end
+
+  -- Repli sur la fenetre du GUI si le parking echoue : mieux vaut un
+  -- clignotement contenu dans la fenetre courante qu'une fenetre `wezterm:
+  -- Connecting...` qui surgit a cote (cf. `attach_host` dans lua/domains.lua).
+  local host_window = hidden_host_window()
+
+  if not host_window then
+    local host_ok, gui_host = pcall(function()
+      return gui_window and gui_window:mux_window()
+    end)
+
+    host_window = host_ok and gui_host or nil
+  end
+
+  -- `start_local_mux` ne rend true QUE s'il vient reellement de lancer un
+  -- serveur (cf. lua/domains.lua) : c'est notre signal de demarrage a froid.
+  local cold_start = false
+
   for _, domain in ipairs(wanted) do
     if domains.is_local(domain) then
-      domains.start_local_mux()
+      cold_start = domains.start_local_mux()
       break
     end
   end
 
-  wezterm.time.call_after(preload_delay, function()
-    local ok, err = pcall(preload_domains, wanted)
+  local delay = cold_start and preload_delay_cold or preload_delay_warm
+
+  -- PRECHARGEMENT MUET. Il tourne avant toute intention de l'utilisateur : rien
+  -- de ce qu'il apprend ne demande une action immediate, et un domaine
+  -- injoignable sera de toute facon signale au moment ou l'on ouvrira un
+  -- workspace qui en depend (cf. `restore_workspace`). Le bilan part donc au
+  -- journal, jamais a l'ecran.
+  local labels = domain_labels(wanted)
+
+  append_debug('prechargement demarre domaines=' .. table.concat(labels, ',')
+    .. ' froid=' .. tostring(cold_start) .. ' delai=' .. tostring(delay))
+
+  local gui_host_ok, gui_host = pcall(function()
+    return gui_window and gui_window:mux_window()
+  end)
+
+  local waiting = open_waiting_screen(gui_host_ok and gui_host or nil, labels)
+
+  wezterm.time.call_after(delay, function()
+    local ok, ready, failed = pcall(preload_domains, wanted, host_window)
+
+    -- L'ecran se ferme QUOI QU'IL ARRIVE : le laisser ouvert sur une erreur
+    -- enfermerait l'utilisateur dans un pane qui dort une heure.
+    close_waiting_screen(gui_window, waiting)
 
     if not ok then
-      append_debug('prechargement erreur: ' .. tostring(err))
+      append_debug('prechargement erreur: ' .. tostring(ready))
+      return
     end
+
+    append_debug('prechargement termine prets=' .. table.concat(domain_labels(ready), ',')
+      .. ' echecs=' .. table.concat(domain_labels(failed), ','))
   end)
 end
 
@@ -1626,7 +2065,13 @@ local function restore_workspace(window, pane, workspace, attempt)
     end
 
     wezterm.time.call_after(ATTACH_RETRY_DELAY, function()
-      local ok, reason = domains.preload(workspace.domain)
+      -- Meme raison qu'au prechargement : sans fenetre hote, le rattachement
+      -- fait clignoter une fenetre « wezterm: Connecting... ».
+      local host_win_ok, host_win = pcall(function()
+        return window:mux_window()
+      end)
+
+      local ok, reason = domains.preload(workspace.domain, host_win_ok and host_win or nil)
 
       if not ok then
         append_debug('restore attente domaine=' .. tostring(workspace.domain)
@@ -2142,7 +2587,7 @@ end
 -- pas enregistre tout de suite ; il le sera a la prochaine action ou a la
 -- prochaine ouverture du workspace.
 
-wezterm.on('update-status', function()
+wezterm.on('update-status', function(window)
   -- Uniquement cote GUI. Le wezterm-mux-server local lit ce meme fichier de
   -- config ; sans ce test il tiendrait sa propre boucle de sauvegarde sur le
   -- meme registre, avec une vision partielle.
@@ -2150,7 +2595,7 @@ wezterm.on('update-status', function()
     return
   end
 
-  run_preload_once()
+  run_preload_once(window)
 end)
 
 -- Conservee : `wezterm.lua` l'appelle. Le branchement se fait desormais a

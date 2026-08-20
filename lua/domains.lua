@@ -217,17 +217,69 @@ end
 -- Exactement la commande que WezTerm lance lui-meme dans ce cas, prise a cote du
 -- binaire courant plutot que dans le PATH.
 local START_REQUESTED = 'local_mux_start_requested'
+local MUX_SERVER_IMAGE = 'wezterm-mux-server.exe'
 
 local function mux_server_path()
   if M.is_windows() then
-    return wezterm.executable_dir .. '\\wezterm-mux-server.exe'
+    return wezterm.executable_dir .. '\\' .. MUX_SERVER_IMAGE
   end
 
   return wezterm.executable_dir .. '/wezterm-mux-server'
 end
 
--- Une seule demande par process GUI : un deuxieme serveur ne pourrait de toute
--- facon pas prendre le socket, il se contenterait de mourir en journalisant.
+-- Un mux-server tourne-t-il DEJA sur cette machine ?
+--
+-- `tasklist` sort TOUJOURS en succes, y compris quand son filtre ne trouve rien
+-- (« INFO: No tasks are running... ») : c'est sa SORTIE qu'il faut lire, jamais
+-- son code de retour. Meme ordre de cout que le `where.exe` de `shell_exists`,
+-- sans commune mesure avec un `powershell.exe -Command` (~300 ms rien que pour
+-- demarrer l'interpreteur) — on est sur le thread GUI, au demarrage.
+--
+-- FAIL-OPEN : si la detection echoue, on demarre. Un serveur en trop coute un
+-- process ; un serveur manquant coute son demarrage SOUS LA FRAPPE.
+local function local_mux_running()
+  if not M.is_windows() then
+    return false
+  end
+
+  local ok, success, stdout = pcall(function()
+    return wezterm.run_child_process {
+      'tasklist.exe', '/FI', 'IMAGENAME eq ' .. MUX_SERVER_IMAGE, '/NH',
+    }
+  end)
+
+  if not ok or success ~= true or type(stdout) ~= 'string' then
+    return false
+  end
+
+  return stdout:find(MUX_SERVER_IMAGE, 1, true) ~= nil
+end
+
+-- Une seule demande par process GUI, ET seulement si aucun serveur ne tourne.
+--
+-- CE GARDE-FOU PROTEGE LA PERSISTANCE DU MUX LOCAL, pas seulement la table des
+-- process. Un mux-server qui demarre alors que le socket est deja pris ne meurt
+-- PAS — ce que pretendait le commentaire precedent : il le REBINDE et depossede
+-- son occupant. Mesure du 2026-08-20 : le serveur lance a 11:03:47 (par le GUI
+-- relance a 11:03:45) a recree `sock` a 11:03:47.796 ; celui de 09:57:46 est
+-- reste vivant avec ses quatre pwsh, injoignable par quiconque.
+--
+-- Consequence tant qu'on demarrait sans sonder : a chaque lancement, le client
+-- tombait sur un serveur NEUF qui ne connaissait aucun workspace — d'ou les
+-- `chaud-devant windows=0` au journal, et une reconstruction depuis le snapshot
+-- la ou un rattachement etait attendu. Les panes survivaient bien a la fermeture
+-- du GUI, mais dans un process que plus personne ne pouvait joindre : la seule
+-- raison d'etre du mux local etait annulee, et les shells s'accumulaient (neuf
+-- pwsh vivants pour quatre panes affiches, releve a 11:04).
+--
+-- Le drapeau GLOBAL ne protege QUE d'une double demande dans le meme process ;
+-- il ne sait rien d'un serveur laisse par le process PRECEDENT — or le mux local
+-- survit a la fermeture du GUI, c'est sa raison d'etre. D'ou la sonde.
+--
+-- Si le serveur ainsi detecte ne repond finalement pas au socket, `M.preload`
+-- retombe sur le demarrage par WezTerm au rattachement : on perd l'anticipation,
+-- pas la connexion.
+--
 -- Retourne true si la demande vient d'etre emise.
 function M.start_local_mux()
   if wezterm.GLOBAL[START_REQUESTED] then
@@ -235,6 +287,10 @@ function M.start_local_mux()
   end
 
   wezterm.GLOBAL[START_REQUESTED] = true
+
+  if local_mux_running() then
+    return false
+  end
 
   local ok, err = pcall(function()
     wezterm.background_child_process { mux_server_path(), '--daemonize' }
@@ -265,7 +321,7 @@ end
 --
 -- SEUL POINT D'ENTREE ADMIS HORS DEMARRAGE : tout ce qui part d'une frappe passe
 -- par ici et jamais par `ensure_attached` en direct. Retourne ok, raison.
-function M.preload(name)
+function M.preload(name, host_window)
   name = M.normalize(name)
 
   if not name or name == M.LOCAL then
@@ -276,7 +332,7 @@ function M.preload(name)
     return false, 'injoignable (' .. env.VIBE_ADDR .. ':' .. env.VIBE_TLS_PORT .. ')'
   end
 
-  return M.ensure_attached(name)
+  return M.ensure_attached(name, host_window)
 end
 
 -- « Ce domaine est-il deja utilisable ? » — lecture d'etat pure, qui ne rattache
@@ -308,7 +364,45 @@ end
 -- BLOQUANT : `domain:attach()` est synchrone sur le thread GUI, et il DEMARRE le
 -- serveur si besoin. Ne jamais l'appeler depuis un handler de touche — passer
 -- par `M.preload`, qui sonde d'abord, et le faire en differe.
-function M.ensure_attached(name)
+-- FENETRE HOTE DE LA PROGRESSION DE CONNEXION.
+--
+-- `MuxDomain:attach()` accepte un argument que la doc ne mentionne pas : une
+-- MuxWindow. Verifie dans la source de la version installee (20240203,
+-- `lua-api-crates/mux/src/domain.rs`) :
+--
+--   methods.add_async_method("attach",
+--     |_, this, window: Option<UserDataRef<MuxWindow>>| async move {
+--       domain.attach(window.map(|w| w.0)).await
+--
+-- et cote client (`wezterm-client/src/domain.rs`) ce window_id part tel quel
+-- dans `ConnectionUI::with_params(ConnectionUIParams { window_id, .. })`.
+--
+-- SANS argument, la ConnectionUI s'ouvre DANS SA PROPRE FENETRE : c'est le
+-- « wezterm: Connecting... » qui clignote au demarrage. Capture le 2026-08-20
+-- par echantillonnage a 100 ms des fenetres de premier plan — classe
+-- org.wezfurlong.wezterm, 1550x926, visible 123 ms (11:03:49.748 a
+-- 11:03:49.871), pile sur le rattachement du prechargement. AVEC une fenetre,
+-- elle s'affiche dedans et aucune fenetre n'apparait.
+--
+-- La fenetre du prechargement est capturee a t+0 et servie a t+2 s : elle peut
+-- avoir disparu entre temps, d'ou la validation avant usage.
+local function attach_host(mux_window)
+  if mux_window == nil then
+    return nil
+  end
+
+  local ok = pcall(function()
+    return mux_window:window_id()
+  end)
+
+  if not ok then
+    return nil
+  end
+
+  return mux_window
+end
+
+function M.ensure_attached(name, host_window)
   name = M.normalize(name)
 
   if not name or name == M.LOCAL then
@@ -325,9 +419,23 @@ function M.ensure_attached(name)
     return false, 'domaine inconnu'
   end
 
+  local host = attach_host(host_window)
+
   local attached, err = pcall(function()
-    domain:attach()
+    if host then
+      domain:attach(host)
+    else
+      domain:attach()
+    end
   end)
+
+  -- Repli sans fenetre hote : un clignotement vaut mieux qu'un domaine non
+  -- rattache, qui ferait s'ouvrir vide le workspace suivant.
+  if not attached and host then
+    attached, err = pcall(function()
+      domain:attach()
+    end)
+  end
 
   if not attached then
     return false, tostring(err)

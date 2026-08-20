@@ -276,10 +276,76 @@ Points de maintenance :
     couteuse et on ne peut pas la raccourcir : on la lance donc au plus tot.
     Possible seulement depuis que la fenetre d'amorcage du serveur est garee
     (cf. `mux-startup`) ; c'est elle qui interdisait ce demarrage anticipe.
+    **Garde-fou obligatoire** : on ne demande le demarrage que si `tasklist` ne
+    voit aucun `wezterm-mux-server.exe`. Le drapeau `wezterm.GLOBAL` ne protege
+    que d'une double demande DANS le meme process ; il ne sait rien d'un serveur
+    laisse par le process PRECEDENT — or le mux local survit a la fermeture du
+    GUI, c'est sa raison d'etre. Ce n'est pas une economie de process : un
+    mux-server qui demarre alors que le socket est pris le **rebinde** et
+    depossede son occupant. Mesure du 2026-08-20 : `sock` recree a 11:03:47.796
+    par le serveur lance avec le GUI de 11:03:45, celui de 09:57:46 laisse vivant
+    et injoignable avec ses quatre pwsh. Le client tombait donc a chaque
+    lancement sur un serveur NEUF (`chaud-devant windows=0` au journal) et
+    reconstruisait depuis le snapshot au lieu de se rattacher : la persistance du
+    mux local ne servait a rien.
   - `t+2 s` : `domains.preload()` rattache. Rattacher un serveur QUI TOURNE est
     bon marche ; le distant est en plus sonde avant (poignee de main TCP bornee
     a 800 ms, sans TLS — mesure a 407 ms serveur joignable), pour ne jamais
     payer le timeout.
+  - **LE PRECHARGEMENT NE DOIT RIEN AFFICHER.** Il tourne avant toute intention
+    de l'utilisateur : rien de ce qu'il apprend ne demande une action immediate,
+    et un domaine injoignable sera signale au moment ou l'on ouvrira un workspace
+    qui en depend (`restore_workspace`). Son bilan va au journal.
+    La ConnectionUI de WezTerm, elle, n'est pas optionnelle :
+    `ConnectionUI::with_params` lance `termwiztermtab::run` des sa construction
+    (source de 20240203, `mux/src/connui.rs`), et le seul constructeur muet,
+    `new_headless()`, n'est pas atteignable depuis `Domain::attach` — un
+    rattachement = une UI, deux domaines = deux clignotements. On ne la supprime
+    donc pas, **on choisit ou elle nait** : `hidden_host_window()` fabrique une
+    fenetre du workspace de PARKING sur le domaine integre, et c'est elle qu'on
+    passe a `attach`. Le parking n'etant jamais l'actif, le GUI ne l'affiche a
+    aucun moment ; le domaine integre garantit que la fenetre meurt avec le
+    process GUI, donc que rien ne s'accumule.
+  - **UN SEUL ECRAN DE CONNEXION, LE NOTRE.** Les ConnectionUI etant renvoyees
+    dans le parking, plus rien ne s'affiche de soi-meme : `open_waiting_screen`
+    montre alors un ecran unique, du debut a la fin du prechargement, avec une
+    animation redessinee en place par `inject_output`. C'est un pane et non une
+    surface flottante — WezTerm n'expose rien de tel au Lua, et sa propre
+    « modale » de connexion n'en est pas une non plus (c'est un
+    `termwiztermtab`, donc deja un onglet). Il se ferme sur le retour de
+    `preload_domains`, ce qui est CETTE FOIS le bon signal : `attach` est
+    bloquant jusqu'a la fin de la connexion, et ce qui s'affichait apres coup
+    n'etait que le delai de fermeture de la ConnectionUI — invisible desormais.
+    Fermeture inconditionnelle, erreur comprise : un ecran oublie enfermerait
+    l'utilisateur dans un pane qui dort une heure.
+    Une tentative a ete essayee le 2026-08-20 et retiree le meme jour — ne pas
+    la refaire : fermer sur **`domains.is_attached`** plutot que sur le retour de
+    `preload_domains`. `is_attached` passe a vrai des l'enregistrement du
+    rattachement, bien avant que la connexion soit utilisable ; ce n'est pas un
+    signal de fin, et aucun etat lisible depuis Lua ne l'est. Trois invariants : il vit sur le domaine **integre**
+    (le seul instantane et toujours joignable — le faire naitre dans un mux
+    couterait l'attente qu'il annonce), son programme ne fait que dormir (c'est
+    nous qui le fermons, par `CloseCurrentPane` vise sur CE pane et non
+    `CloseCurrentTab` qui viserait l'onglet actif du moment), et sa fermeture est
+    inconditionnelle — sur erreur de prechargement comprise, sans quoi
+    l'utilisateur reste enferme dans un pane qui dort une heure.
+  - **Le message d'attente se pose a `t+0`, jamais juste avant le
+    rattachement.** Celui-ci est synchrone sur le thread GUI : une notification
+    posee juste avant ne serait peinte qu'une fois le rattachement fini, donc
+    jamais pendant l'attente qu'elle couvre. Sa duree
+    (`preload_notice_ms`) doit couvrir `preload_delay` plus la poignee de main.
+    Le bilan (`Domaines prets` / `Domaines injoignables`) le remplace ensuite —
+    `lua/notify.lua` n'a qu'un slot, il n'y a rien a effacer.
+  - **La progression de connexion a besoin d'une fenetre hote.**
+    `MuxDomain:attach()` accepte une MuxWindow — non documentee, mais bien
+    presente dans la source de 20240203 (`lua-api-crates/mux/src/domain.rs`), et
+    transmise telle quelle a `ConnectionUIParams { window_id, .. }`. Sans elle,
+    WezTerm ouvre une fenetre `wezterm: Connecting...` le temps de la poignee de
+    main : relevee le 2026-08-20 par echantillonnage a 100 ms des fenetres de
+    premier plan (classe `org.wezfurlong.wezterm`, 1550x926, visible 123 ms,
+    exactement sur le rattachement du prechargement). Toujours passer la fenetre
+    courante a `domains.preload` / `domains.ensure_attached` — c'est le seul
+    levier, il n'existe pas de mode silencieux cote config.
   - **Sous une frappe, on ne rattache jamais** : `restore_workspace` interroge
     `domains.is_attached` (lecture d'etat pure), et si le domaine n'est pas
     pret il demande le demarrage, notifie, et se rappelle en differe
