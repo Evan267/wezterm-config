@@ -11,9 +11,35 @@ local error_duration = 5000
 -- affiche indefiniment.
 local active_notification = nil
 
+-- NE POSER QUE CE QUI CHANGE.
+--
+-- `set_right_status` marque la barre de statut SALE meme quand le texte est
+-- identique : repose a chaque tick, il fait repeindre la fenetre en continu.
+-- C'est l'une des trois sources de repeint inutile trouvees le 2026-08-21 dans
+-- le GUI fige (boucle a 96 % d'un coeur en syscalls fenetre, sans aucune E/S,
+-- cf. `switch_to_workspace` dans lua/workspaces.lua).
+--
+-- Memo par fenetre, et non global : deux fenetres n'affichent pas forcement la
+-- meme chose, et l'une ne doit pas empecher l'autre de se mettre a jour.
+local last_posted = {}
+
 local function render(window)
+  local text = active_notification and active_notification.text or ''
+
+  local ok, window_id = pcall(function()
+    return window:window_id()
+  end)
+
+  local key = (ok and window_id) or 'sans-id'
+
+  if last_posted[key] == text then
+    return
+  end
+
+  last_posted[key] = text
+
   pcall(function()
-    window:set_right_status(active_notification and active_notification.text or '')
+    window:set_right_status(text)
   end)
 end
 

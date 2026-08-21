@@ -406,7 +406,8 @@ Points de maintenance :
 - **Override `default_domain` par fenetre** : `ALT+SHIFT+D` passe par
   `window:set_config_overrides`. Tout autre `set_config_overrides` doit reporter
   `default_domain`, sinon il efface silencieusement le choix. C'est le cas du
-  handler de bascule clair/sombre dans `lua/options.lua`. Ne pas regresser.
+  handler de bascule clair/sombre dans `lua/options.lua`, qui MODIFIE la table
+  d'overrides existante au lieu d'en reconstruire une. Ne pas regresser.
 - **`CurrentPaneDomain` pour tabs et splits** : `M.spawn_tab` et `M.split_pane`
   epinglent explicitement `CurrentPaneDomain`. Sans cela, un tab ouvert dans un
   workspace distant depuis une fenetre restee locale par defaut partait sur la
@@ -596,6 +597,23 @@ Le module `lua/workspaces.lua` capture/restaure les workspaces dans
   porter que si sa cible est **deja vivante** — sur un workspace vide, une
   bascule sans `spawn` n'est pas neutre pour autant, elle retombe sur
   `SpawnCommand::default()`, donc sur `CurrentPaneDomain`. Ne pas regresser.
+- **Bascule : ne verifier que ce qui peut rater.** `switch_to_workspace` prend
+  desormais `{ verify = true }`, et SEULS les chemins qui viennent de creer la
+  fenetre du workspace le passent (`restore_workspace_in_current_window`, le
+  repli « legacy », `create_workspace`). C'est le seul cas ou
+  `reconcile_workspace` rebascule d'autorite : le cache `num_panes_by_workspace`
+  ne compte pas encore les panes de la cible (cf. `spawn_workspace_window`).
+  Rejoindre un workspace DEJA VIVANT n'a jamais produit une ligne « bascule non
+  prise » — mais verifier quand meme posait, a chaque frappe, un minuteur de
+  relecture, un `focus()` de fenetre et une bascule de plus. En rafale, tout cela
+  s'empilait sur le thread GUI : c'est le figeage du 2026-08-21 (voir
+  « Points d'attention »). Le chemin vivant est donc UNE action, sans minuteur.
+- **Arriver dans un workspace ne le modifie pas** : pas de `save_soon` sur le
+  chemin vivant de `restore_ready_workspace`. La capture reparcourt tous les
+  panes du workspace — un aller-retour reseau par pane sur un workspace vibe — et
+  elle partait 2 s apres CHAQUE bascule pour reenregistrer une disposition
+  inchangee. Les captures restent sur les actions qui changent vraiment quelque
+  chose (split, onglet, renommage, creation, restauration).
 
 ## Documentation
 
@@ -656,15 +674,60 @@ controle avec `string.char(13)` plutot que `
 
 ## Points d'attention
 
+- **`update-status` EST UN CHEMIN CHAUD : n'y poser que ce qui change.**
+  L'evenement tire au moins une fois par seconde et par fenetre, et tous les
+  handlers tournent sur le thread GUI. Or `set_left_status`, `set_right_status`
+  et `set_config_overrides` marquent la fenetre SALE meme quand la valeur posee
+  est identique : reposee a chaque tick, elle fait repeindre la fenetre en
+  continu. `window:effective_config()` est pire — il reconstruit toute la table
+  de config pour qu'on en lise un champ.
+  Constat du 2026-08-21, GUI fige apres une bascule de workspace : boucle a 96 %
+  d'un coeur DANS `wezterm-gui.exe`, en syscalls fenetre (`win32u.dll`), avec
+  **zero lecture et zero ecriture disque** (donc aucun rechargement de config),
+  une **seule** fenetre GUI (donc aucune volee de fenetres), la connexion TLS a
+  vibe intacte — et **plus une seule ligne au journal** apres
+  « restore live switch » : le Lua n'a plus jamais eu la main. Le process n'avait
+  pas crashe (aucun AppCrash/AppHang au journal Windows), il etait enferme.
+  Les trois handlers concernes memoisent desormais PAR FENETRE et ne posent que
+  sur changement : `lua/notify.lua` (statut droit), `lua/status.lua` (statut
+  gauche, plus d'`effective_config()` par tick — le scheme se lit dans les
+  overrides de la fenetre), `lua/options.lua` (theme, plus de
+  `get`/`set_config_overrides` par tick). Ne pas regresser : tout ajout dans un
+  `update-status` doit etre garde par un memo scalaire dans `wezterm.GLOBAL`
+  (une cle par fenetre, `GLOBAL` ne conservant pas la mutation d'une table
+  imbriquee).
 - Les plugins WezTerm peuvent necessiter un acces reseau au premier chargement.
 - Les raccourcis documentes ne sont fiables que si `lua/keys.lua` est effectivement applique dans `wezterm.lua`.
 - Eviter de reintroduire un plugin de persistance de session sans validation specifique sous Windows.
-- Detection du theme clair/sombre (`lua/options.lua`) : utiliser l'API native
-  `window:get_appearance()` / `wezterm.gui.get_appearance()`. Ne PAS revenir a une
+- Theme clair/sombre applique PAR FENETRE (`lua/options.lua`) :
+  `window:get_appearance()` a chaque tick, pose par `set_config_overrides` sur
+  la fenetre. `config.color_scheme` seul ne suffit pas — il est calcule une fois
+  par evaluation de config, hors de toute fenetre, donc les fenetres nees
+  ensuite (les workspaces crees en cours de session) heritaient d'une valeur
+  figee et s'ouvraient en clair au milieu de fenetres sombres (2026-08-20). Ne
+  PAS passer par `ReloadConfiguration` pour cela : le rechargement repeint les
+  panes mux en blocs et tue les timers en vol. Ne PAS revenir non plus a une
+  detection via `reg.exe`. Ne PAS revenir a une
   detection via `reg.exe` : le handler `update-status` tourne toutes les 1000 ms et
   un appel `wezterm.run_child_process` y est synchrone sur le thread GUI (~36 ms a
   chaque tick), ce qui rend l'interface moins reactive (jitter a l'ouverture d'un
   pane inclus).
+- **Creer la fenetre d'un workspace : passer par `wezterm.mux.rename_workspace`**
+  (`lua/workspaces.lua`, `spawn_workspace_window`), jamais par
+  `MuxWindow:set_workspace` seul. `Mux::is_workspace_empty` ne compte pas les
+  panes : il lit le cache `num_panes_by_workspace`, que seul un ajout/retrait de
+  pane, d'onglet ou de fenetre reconstruit — jamais un changement de workspace.
+  Une fenetre nee dans le parking puis renommee laissait donc sa cible « vide »
+  aux yeux de `reconcile_workspace`, qui rebasculait d'autorite sur le premier
+  workspace non vide : le workspace existait, on n'y arrivait jamais (2026-08-20).
+  `rename_workspace` fait le meme `Window::set_workspace` (donc la meme
+  notification vers le mux-server) PUIS `recompute_pane_count()`. Il refuse de
+  renommer un nom en lui-meme, d'ou l'escale sous un nom de parking unique.
+- **`gui_window:restore()` n'est pas « restaurer une fenetre reduite »** : il
+  sort la fenetre de l'etat MAXIMISE. L'appeler a chaque arrivee dans un
+  workspace rapetissait la fenetre en pleine session (2026-08-20), en
+  contradiction avec `M.apply_startup_maximize`. Pour donner le focus, `focus()`
+  suffit.
 - Front-end de rendu (`lua/options.lua`) : forcer `config.front_end = "OpenGL"`. Le
   defaut WebGpu sur Windows laisse par moments des regions non-repeintes apres un
   split/resize/restauration de workspace (panes qui semblent s'arreter avant le bas,
@@ -685,9 +748,10 @@ controle avec `string.char(13)` plutot que `
   enregistre » mais jamais « handler appele » ; enregistrement inconditionnel =
   handler appele). La garde n'enregistre le handler qu'a la PREMIERE evaluation
   de la config, alors que seuls les handlers de l'evaluation courante sont
-  vivants. Corollaire a verifier : le handler de bascule clair/sombre de
-  `lua/options.lua` porte exactement cette garde
-  (`DYNAMIC_COLOR_SCHEME_EVENT_VERSION`) et est donc probablement mort lui aussi.
+  vivants. Corollaire CONFIRME puis corrige le 2026-08-20 : le handler de
+  bascule clair/sombre de `lua/options.lua` portait exactement cette garde
+  (`DYNAMIC_COLOR_SCHEME_EVENT_VERSION`) et etait mort de la meme facon. La
+  garde a ete supprimee.
   Le modele qui marche est celui de `lua/workspaces.lua` : `wezterm.on` a chaque
   evaluation du module, et l'etat anti-repetition dans `wezterm.GLOBAL` sous une
   CLE SCALAIRE (`GLOBAL` ne conserve pas la mutation d'une table imbriquee).

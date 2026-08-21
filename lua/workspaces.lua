@@ -49,7 +49,9 @@ local function is_saveable_workspace(name)
   return type(name) == 'string'
     and name ~= ''
     and name ~= scratch_workspace
-    and name ~= parking_workspace
+    -- Prefixe et non egalite : chaque construction de fenetre passe par une
+    -- escale sous un nom de parking UNIQUE (cf. `staging_workspace`).
+    and name:sub(1, #parking_workspace) ~= parking_workspace
 end
 
 local notify = notifications.info
@@ -750,29 +752,19 @@ local function merge_spawn_options(base, spawn)
   return base
 end
 
+-- PAS de `restore()` ici. Il ne "restaure" pas une fenetre reduite : il la
+-- sort de l etat MAXIMISE pour la ramener a sa taille normale. Appele a chaque
+-- arrivee dans un workspace, il repetissait la fenetre sous les yeux de
+-- l utilisateur (constate le 2026-08-20), en contradiction directe avec la
+-- maximisation systematique de lua/options.lua.
 local function focus_mux_window(mux_window)
   if not mux_window then
     return
   end
 
   pcall(function()
-    local gui_window = mux_window:gui_window()
-    gui_window:restore()
-    gui_window:focus()
+    mux_window:gui_window():focus()
   end)
-end
-
-local function focus_mux_window_soon(mux_window)
-  focus_mux_window(mux_window)
-
-  if wezterm.time and wezterm.time.call_after then
-    wezterm.time.call_after(0.2, function()
-      focus_mux_window(mux_window)
-    end)
-    wezterm.time.call_after(0.6, function()
-      focus_mux_window(mux_window)
-    end)
-  end
 end
 
 -- Fenetres mux portant ce workspace (souvent zero : le nom peut exister dans
@@ -1325,14 +1317,33 @@ end
 -- `close_workspace_session` : on sait ce qui y tourne. Les onglets de
 -- ConnectionUI encore presents dans cette fenetre ne sont pas notre affaire —
 -- la connexion est etablie, ils se ferment d'eux-memes, et ils sont invisibles.
+--
+-- REPETE, parce qu'une seule fois ne suffit pas : le `exit` part une seconde
+-- apres le spawn, avant que pwsh n'ait ouvert son invite, et tombe dans le
+-- vide. Constate le 2026-08-20 (`wezterm cli list`) : une fenetre
+-- `wezterm-amorcage` vivante par lancement, reimportee a chaque rattachement.
+-- Les envois suivants trouvent un shell pret ; ceux qui arrivent apres sa mort
+-- echouent sans consequence (le pcall les avale).
+local RELEASE_RETRY_DELAYS = { 2, 5, 10 }
+
 local function release_hidden_host(host_pane)
   if not host_pane then
     return
   end
 
-  local ok = pcall(function()
-    host_pane:send_text('exit\r')
-  end)
+  local function send_exit()
+    return pcall(function()
+      host_pane:send_text('exit\r')
+    end)
+  end
+
+  local ok = send_exit()
+
+  if wezterm.time and wezterm.time.call_after then
+    for _, delay in ipairs(RELEASE_RETRY_DELAYS) do
+      wezterm.time.call_after(delay, send_exit)
+    end
+  end
 
   append_debug('fenetre hote invisible liberee ok=' .. tostring(ok))
 end
@@ -1614,6 +1625,15 @@ local function close_waiting_screen(gui_window, waiting)
   end
 
   waiting.open = false
+
+  -- REACTIVER L ONGLET D ATTENTE AVANT DE LE FERMER. `CloseCurrentPane` vise le
+  -- pane ACTIF de la GuiWindow et ignore celui qu on lui passe (verifie le
+  -- 2026-08-20, cf. `kill_workspace_session`) : sans cette activation, un
+  -- utilisateur qui change d onglet pendant le prechargement se ferait fermer
+  -- SON pane a la place.
+  pcall(function()
+    waiting.tab:activate()
+  end)
 
   local ok, err = pcall(function()
     gui_window:perform_action(
@@ -1936,6 +1956,189 @@ local function restore_layout_in_window(window, mux_window, workspace)
 end
 
 -- ---------------------------------------------------------------------------
+-- BASCULE VERIFIEE VERS UN WORKSPACE
+--
+-- `SwitchToWorkspace` ne prend pas toujours. `reconcile_workspace`
+-- (wezterm-gui/src/frontend.rs) rebascule d'autorite sur le premier workspace
+-- non vide qu'il trouve - `default` - des que la cible lui parait encore vide,
+-- et une fenetre tout juste creee sur un domaine mux l'est encore le temps que
+-- le serveur confirme son onglet. Meme piege que celui decrit sous
+-- `spawn_workspace_window`, mais du cote de la BASCULE et non du spawn : la
+-- creation reussit, c'est l'arrivee qui se fait rejeter.
+--
+-- Mesure du 2026-08-20 sur `evacuation-list` (localmux, cree par ALT+n) :
+-- « fenetre creee » au journal, fenetre bien presente cote mux
+-- (`wezterm cli list` : window 5, workspace evacuation-list, 1 pane), et
+-- pourtant rien a l'ecran - `wezterm cli list-clients` montrait le GUI reste
+-- sur `default`. Le workspace existait, personne ne pouvait le voir.
+--
+-- On rejoue donc la bascule tant que `active_workspace()` ne repond pas la
+-- cible. Seul le premier essai part de la frappe, les suivants d'un timer.
+-- `SWITCH_TARGET` fait gagner la DERNIERE bascule demandee : sans lui,
+-- ALT+SHIFT+R, qui en enchaine une par workspace, les ferait se disputer
+-- l'actif pendant toute la duree des essais.
+-- ESPACER, PAS MARTELER. Mesure du 2026-08-20 : a 0,25 s d'intervalle, la
+-- bascule vers un workspace tout juste cree echouait sept a neuf fois de suite,
+-- puis aboutissait des qu'on cessait de la rejouer (`tme` : « prise essai=7 »,
+-- soit exactement le moment ou les essais s'arretaient). Le front-end n'a qu'un
+-- booleen `switching_workspaces` pour toute l'application (cf.
+-- `spawn_workspace_window`) : chaque rejeu ECRASE la bascule en vol au lieu de
+-- l'aider. Une seconde et demie laisse la premiere aboutir ; deux rejeux
+-- suffisent alors, et le dernier mot revient a une simple relecture.
+local SWITCH_RETRY_DELAY = 1.5
+local SWITCH_MAX_RETRIES = 2
+local SWITCH_TARGET = 'workspace_switch_target'
+
+-- L'actif se lit sur le MUX, jamais sur la GuiWindow : l'objet GuiWindow reste
+-- lie a la fenetre mux qu'il avait a la frappe (cf. `restore_layout_in_window`),
+-- donc `window:active_workspace()` continue de repondre l'ANCIEN nom meme apres
+-- une bascule reussie — de quoi rejouer indefiniment sur un faux echec.
+local function active_workspace(window)
+  local ok, name = pcall(function()
+    if wezterm.mux and wezterm.mux.get_active_workspace then
+      return wezterm.mux.get_active_workspace()
+    end
+
+    return window:active_workspace()
+  end)
+
+  return ok and name or nil
+end
+
+-- Arrivee : « rediriger » ne s'arrete pas a rendre le workspace actif, la
+-- fenetre qui vient d'apparaitre doit aussi recevoir la frappe suivante.
+local function arrive_in_workspace(name)
+  focus_mux_window(workspace_mux_windows(name)[1])
+end
+
+-- VERIFIER N'EST PAS GRATUIT : ON NE VERIFIE QUE CE QUI PEUT RATER.
+--
+-- Le rejeu decrit ci-dessus a ete ecrit pour UN cas : la bascule vers un
+-- workspace TOUT JUSTE CREE, que `reconcile_workspace` refuse tant que le cache
+-- `num_panes_by_workspace` ne compte pas ses panes (cf. `spawn_workspace_window`).
+-- Rejoindre un workspace DEJA VIVANT ne peut pas tomber dans ce trou : ses panes
+-- sont comptes depuis longtemps, le front-end n'a aucune raison de rebasculer —
+-- et de fait, pas une seule ligne « bascule non prise » n'est jamais sortie sur
+-- ce chemin.
+--
+-- L'y appliquer quand meme a fige le GUI le 2026-08-21. Chaque frappe posait un
+-- minuteur de verification, un `focus()` de fenetre et une relecture de l'actif ;
+-- une rafale de frappes empilait tout cela sur le thread GUI. Diagnostic du
+-- process fige : boucle a 96 % d'un coeur DANS wezterm-gui.exe, en syscalls
+-- fenetre (win32u), 0 lecture et 0 ecriture disque, une seule fenetre GUI (donc
+-- ni rechargement de config, ni reseau, ni volee de fenetres) — et plus une
+-- seule ligne au journal apres « restore live switch », le Lua n'ayant plus
+-- jamais eu la main.
+--
+-- `verify = true` n'est donc pose QUE par les chemins qui viennent de creer la
+-- fenetre du workspace.
+local function switch_to_workspace(window, pane, name, opts)
+  opts = opts or {}
+
+  local attempt = opts.attempt or 0
+  local verify = opts.verify == true
+
+  -- La DERNIERE bascule demandee gagne. Sans ce jeton, ALT+SHIFT+R, qui en
+  -- enchaine une par workspace, les ferait se disputer l'actif pendant toute la
+  -- duree des essais — et une verification encore en vol ramenerait
+  -- l'utilisateur en arriere apres qu'il a change d'avis.
+  if attempt == 0 then
+    wezterm.GLOBAL[SWITCH_TARGET] = name
+  elseif wezterm.GLOBAL[SWITCH_TARGET] ~= name then
+    return
+  end
+
+  -- Le pane d'origine peut avoir disparu entre temps (overlay referme, bascule
+  -- precedente) : on repart du pane actif de la fenetre quand il y en a un.
+  local ok_pane, active = pcall(function()
+    return window:active_pane()
+  end)
+
+  local ok, err = pcall(function()
+    window:perform_action(
+      wezterm.action.SwitchToWorkspace { name = name },
+      (ok_pane and active) or pane
+    )
+  end)
+
+  if not ok then
+    append_debug('bascule erreur name=' .. tostring(name) .. ' err=' .. tostring(err))
+  end
+
+  -- Au rejeu, on double l'action GUI d'une bascule au niveau du MUX : ce n'est
+  -- pas le meme chemin de code — `set_active_workspace` n'emprunte pas
+  -- l'assignation de touche du TermWindow — et c'est exactement l'etat que
+  -- `reconcile_workspace` relit.
+  if attempt > 0 and wezterm.mux and wezterm.mux.set_active_workspace then
+    if not pcall(function() wezterm.mux.set_active_workspace(name) end) then
+      pcall(function() wezterm.mux.set_active_workspace { workspace = name } end)
+    end
+  end
+
+  -- FIN DU CHEMIN CHAUD. Une bascule vers un workspace vivant, c'est une action
+  -- et rien d'autre : pas de minuteur, pas de relecture, pas de `focus()`. Elle
+  -- peut donc etre repetee aussi vite que l'utilisateur appuie.
+  if not verify then
+    return
+  end
+
+  if not (wezterm.time and wezterm.time.call_after) then
+    return
+  end
+
+  -- Une relecture par essai, plus une derniere apres le dernier rejeu : la
+  -- bascule aboutit parfois APRES qu'on a cesse d'insister, et annoncer un
+  -- echec dans ce cas serait mentir a l'utilisateur.
+  wezterm.time.call_after(SWITCH_RETRY_DELAY, function()
+    if wezterm.GLOBAL[SWITCH_TARGET] ~= name then
+      return
+    end
+
+    local current = active_workspace(window)
+
+    if current == name then
+      if attempt > 0 then
+        append_debug('bascule prise name=' .. tostring(name) .. ' essai=' .. attempt)
+      end
+
+      arrive_in_workspace(name)
+      return
+    end
+
+    -- Plus aucune fenetre a rejoindre : le workspace a ete ferme entre temps.
+    -- Insister ferait tourner les essais dans le vide.
+    if #workspace_mux_windows(name) == 0 then
+      append_debug('bascule sans cible name=' .. tostring(name))
+      return
+    end
+
+    append_debug('bascule non prise name=' .. tostring(name)
+      .. ' actif=' .. tostring(current)
+      .. ' essai=' .. attempt)
+
+    if attempt < SWITCH_MAX_RETRIES then
+      switch_to_workspace(window, pane, name, { verify = true, attempt = attempt + 1 })
+      return
+    end
+
+    wezterm.time.call_after(SWITCH_RETRY_DELAY, function()
+      if wezterm.GLOBAL[SWITCH_TARGET] ~= name then
+        return
+      end
+
+      if active_workspace(window) == name then
+        append_debug('bascule prise tardivement name=' .. tostring(name))
+        arrive_in_workspace(name)
+        return
+      end
+
+      append_debug('bascule abandonnee name=' .. tostring(name))
+      notify_error(window, 'Bascule impossible vers: ' .. name)
+    end)
+  end)
+end
+
+-- ---------------------------------------------------------------------------
 -- CREATION DE LA FENETRE D'UN WORKSPACE
 --
 -- C'est le SEUL endroit du depot qui cree la fenetre d'un workspace, et il
@@ -1978,8 +2181,53 @@ end
 -- qui existe deja, donc plus d'aller-retour asynchrone ou l'actif puisse
 -- deriver.
 -- ---------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------
+-- POURQUOI `rename_workspace` ET NON `MuxWindow:set_workspace`
+--
+-- C'est LA cause de « le workspace est cree mais on n'y arrive pas », traquee
+-- toute la journee du 2026-08-20 et trouvee dans le source de la version
+-- installee (20240203).
+--
+-- `reconcile_workspace` (wezterm-gui/src/frontend.rs) commence par :
+--
+--   if mux.is_workspace_empty(&workspace) { ... bascule d'autorite sur le
+--       premier workspace NON vide ... }
+--
+-- et `Mux::is_workspace_empty` (mux/src/lib.rs) ne compte pas les panes : il
+-- LIT UN CACHE, `num_panes_by_workspace`. Ce cache n'est reconstruit
+-- (`recompute_pane_count`) que par l'ajout ou le retrait d'un pane, d'un onglet
+-- ou d'une fenetre — JAMAIS par un changement de workspace :
+--
+--   pub fn is_workspace_empty(&self, workspace: &str) -> bool {
+--       *self.num_panes_by_workspace.read().get(workspace).unwrap_or(&0) == 0
+--   }
+--
+-- Notre fenetre naissant dans le parking, son pane etait compte pour le
+-- PARKING ; `set_workspace` la renommait sans toucher au cache, donc la cible
+-- restait « vide » aux yeux du front-end, qui rebasculait aussitot sur le
+-- premier workspace non vide venu. D'ou l'utilisateur laisse sur
+-- `chaud-devant`, et d'ou les bascules qui « prenaient » au septieme essai :
+-- une capture ou un spawn ailleurs avait, entre temps, declenche un recompute.
+--
+-- `Mux::rename_workspace` fait exactement ce qu'il faut, et c'est le seul point
+-- d'entree qui le fasse : le meme `Window::set_workspace` (donc la meme
+-- notification vers le mux-server, ce que 8a40e21 avait paye cher pour
+-- obtenir), PUIS `recompute_pane_count()`. Il refuse en revanche de renommer un
+-- workspace en lui-meme (`if old == new { return }`), d'ou l'escale sous un nom
+-- de parking UNIQUE : renommer emporterait sinon toutes les fenetres qui
+-- traineraient dans le parking commun.
+local PARKING_SEQUENCE = 'workspace_parking_sequence'
+
+local function staging_workspace()
+  local sequence = (tonumber(wezterm.GLOBAL[PARKING_SEQUENCE]) or 0) + 1
+  wezterm.GLOBAL[PARKING_SEQUENCE] = sequence
+
+  return parking_workspace .. '-' .. sequence
+end
+
 local function spawn_workspace_window(name, spawn)
-  local options = merge_spawn_options({ workspace = parking_workspace }, spawn)
+  local staging = staging_workspace()
+  local options = merge_spawn_options({ workspace = staging }, spawn)
 
   local ok, spawned_tab, spawned_pane, mux_window = pcall(function()
     return wezterm.mux.spawn_window(options)
@@ -1992,15 +2240,31 @@ local function spawn_workspace_window(name, spawn)
   end
 
   local renamed, err = pcall(function()
-    mux_window:set_workspace(name)
+    wezterm.mux.rename_workspace(staging, name)
   end)
 
+  -- Repli sur l'ancien chemin si l'API bouge : une fenetre mal comptee vaut
+  -- mieux qu'une fenetre restee dans le parking, invisible pour toujours.
   if not renamed then
-    append_debug('set_workspace echec name=' .. tostring(name) .. ' err=' .. tostring(err))
+    append_debug('rename_workspace indisponible name=' .. tostring(name)
+      .. ' err=' .. tostring(err))
+
+    renamed, err = pcall(function()
+      mux_window:set_workspace(name)
+    end)
+  end
+
+  if not renamed then
+    append_debug('renommage echec name=' .. tostring(name) .. ' err=' .. tostring(err))
     return nil
   end
 
-  append_debug('fenetre creee name=' .. tostring(name))
+  local seen_ok, seen = pcall(function()
+    return mux_window:get_workspace()
+  end)
+
+  append_debug('fenetre creee name=' .. tostring(name)
+    .. ' workspace=' .. tostring(seen_ok and seen))
 
   return mux_window, spawned_pane
 end
@@ -2029,29 +2293,82 @@ local function restore_workspace_in_current_window(window, pane, workspace)
   restore_layout_in_window(window, mux_window, workspace)
   wezterm.GLOBAL[build_flight_key(workspace.name)] = nil
 
-  window:perform_action(
-    wezterm.action.SwitchToWorkspace { name = workspace.name },
-    pane
-  )
+  -- Fenetre tout juste creee : c'est le cas ou `reconcile_workspace` rebascule.
+  switch_to_workspace(window, pane, workspace.name, { verify = true })
 
   save_soon(workspace.name)
 
   return true
 end
 
--- Rythme d'attente du domaine (cf. `restore_workspace`). Six essais couvrent
--- largement le demarrage d'un mux-server ; au-dela, le probleme n'est pas une
--- question de patience.
+-- ---------------------------------------------------------------------------
+-- ATTENDRE UN DOMAINE SANS GELER — LA REGLE, EN UN SEUL ENDROIT
+--
+-- Un domaine mux detache refuse tout spawn : il doit etre rattache AVANT qu'on
+-- ouvre ou cree quoi que ce soit, sinon le workspace s'ouvre vide. Mais
+-- rattacher est SYNCHRONE sur le thread GUI : le faire sous une frappe, c'est
+-- geler le terminal le temps que le serveur reponde — et s'il n'est pas
+-- demarre, le temps qu'il naisse. Mesure du 2026-08-20 : 4,4 s d'interface
+-- morte a la premiere ouverture d'un workspace local, une douzaine de secondes
+-- sur un serveur muet.
+--
+-- On ne rattache donc jamais sous la frappe : on LIT l'etat (`is_attached`, qui
+-- ne peut rien geler), et s'il n'est pas pret on le prepare et on repasse. Le
+-- GUI reste vivant, l'utilisateur voit un message au lieu d'un terminal fige,
+-- et `domains.preload` sonde le distant avant de s'y connecter. L'attente est
+-- bornee : six essais couvrent largement le demarrage d'un mux-server, au-dela
+-- le probleme n'est pas une question de patience.
+--
+-- `subject` n'est la que pour le message d'echec (le nom du workspace vise).
 local ATTACH_RETRY_DELAY = 1.2
 local ATTACH_MAX_RETRIES = 6
 
-local function restore_workspace(window, pane, workspace, attempt)
+local function when_domain_ready(window, domain, subject, on_ready, attempt)
   attempt = attempt or 0
 
-  if attempt == 0 then
-    append_debug('restore start name=' .. tostring(workspace.name)
-      .. ' domain=' .. tostring(workspace.domain))
+  if domains.is_attached(domain) then
+    on_ready()
+    return
   end
+
+  if attempt >= ATTACH_MAX_RETRIES then
+    append_debug('attach abandon domaine=' .. tostring(domain)
+      .. ' pour=' .. tostring(subject))
+    notify_error(window, 'Domaine ' .. domains.label(domain) .. ' injoignable'
+      .. (subject and (': ' .. subject) or ''))
+    return
+  end
+
+  if attempt == 0 then
+    if domains.is_local(domain) then
+      domains.start_local_mux()
+    end
+
+    notify(window, 'Domaine ' .. domains.label(domain) .. ': connexion...')
+  end
+
+  wezterm.time.call_after(ATTACH_RETRY_DELAY, function()
+    -- Meme raison qu'au prechargement : sans fenetre hote, le rattachement fait
+    -- clignoter une fenetre « wezterm: Connecting... ».
+    local host_ok, host = pcall(function()
+      return window:mux_window()
+    end)
+
+    local ok, reason = domains.preload(domain, host_ok and host or nil)
+
+    if not ok then
+      append_debug('attente domaine=' .. tostring(domain) .. ' (' .. tostring(reason) .. ')')
+    end
+
+    when_domain_ready(window, domain, subject, on_ready, attempt + 1)
+  end)
+end
+
+local restore_ready_workspace
+
+local function restore_workspace(window, pane, workspace)
+  append_debug('restore start name=' .. tostring(workspace.name)
+    .. ' domain=' .. tostring(workspace.domain))
 
   -- Reconstruction deja en vol : on la laisse finir, elle bascule elle-meme a la
   -- fin. En relancer une par-dessus creerait un deuxieme jeu de fenetres, et
@@ -2062,68 +2379,31 @@ local function restore_workspace(window, pane, workspace, attempt)
     return
   end
 
-  -- Un domaine mux detache refuse tout spawn : il doit etre rattache AVANT de
-  -- restaurer, sinon le workspace s'ouvre vide. Mais rattacher est SYNCHRONE sur
-  -- le thread GUI : le faire ici, sous la frappe, c'est geler le terminal le
-  -- temps que le serveur reponde — et s'il n'est pas demarre, le temps qu'il
-  -- naisse. Mesure du 2026-08-20 : 4,4 s d'interface morte a la premiere
-  -- ouverture d'un workspace local.
-  --
-  -- On ne rattache donc jamais ici. Si le domaine n'est pas pret, on le prepare
-  -- et on repasse : le GUI reste vivant, l'utilisateur voit un message au lieu
-  -- d'un terminal fige, et le rattachement se fait en differe (`domains.preload`
-  -- sonde le distant avant de s'y connecter, et le mux local a ete demarre entre
-  -- temps). L'attente est bornee.
-  if not domains.is_attached(workspace.domain) then
-    if attempt >= ATTACH_MAX_RETRIES then
-      append_debug('restore attach abandon name=' .. tostring(workspace.name)
-        .. ' domain=' .. tostring(workspace.domain))
-      notify_error(window, 'Domaine ' .. domains.label(workspace.domain) .. ' injoignable: ' .. workspace.name)
-      return
-    end
-
-    if attempt == 0 then
-      if domains.is_local(workspace.domain) then
-        domains.start_local_mux()
-      end
-
-      notify(window, 'Domaine ' .. domains.label(workspace.domain) .. ': connexion...')
-    end
-
-    wezterm.time.call_after(ATTACH_RETRY_DELAY, function()
-      -- Meme raison qu'au prechargement : sans fenetre hote, le rattachement
-      -- fait clignoter une fenetre « wezterm: Connecting... ».
-      local host_win_ok, host_win = pcall(function()
-        return window:mux_window()
-      end)
-
-      local ok, reason = domains.preload(workspace.domain, host_win_ok and host_win or nil)
-
-      if not ok then
-        append_debug('restore attente domaine=' .. tostring(workspace.domain)
-          .. ' (' .. tostring(reason) .. ')')
-      end
-
-      -- Le pane d'origine peut avoir disparu entre temps (overlay referme,
-      -- bascule) : on repart du pane actif de la fenetre.
-      local host_ok, host = pcall(function()
-        return window:active_pane()
-      end)
-
-      restore_workspace(window, (host_ok and host) or pane, workspace, attempt + 1)
+  when_domain_ready(window, workspace.domain, workspace.name, function()
+    -- Le pane d'origine peut avoir disparu pendant l'attente (overlay referme,
+    -- bascule) : on repart du pane actif de la fenetre.
+    local host_ok, host = pcall(function()
+      return window:active_pane()
     end)
 
-    return
-  end
+    restore_ready_workspace(window, (host_ok and host) or pane, workspace)
+  end)
+end
 
+-- Corps de la restauration, une fois le domaine joignable.
+function restore_ready_workspace(window, pane, workspace)
   -- PAS de mode « nouvelle fenetre ». Invariant du depot : une seule fenetre
   -- ouverte a la fois. Un workspace s'ouvre la ou on est — WezTerm y revele la
   -- fenetre du workspace cible — jamais a cote.
   if workspace_is_live(workspace.name) then
     append_debug('restore live switch name=' .. tostring(workspace.name))
 
-    window:perform_action(wezterm.action.SwitchToWorkspace { name = workspace.name }, pane)
-    save_soon(workspace.name)
+    -- PAS de `save_soon` ici. ARRIVER dans un workspace ne le change pas : sa
+    -- disposition est celle qu'on a deja enregistree en la quittant, ou a la
+    -- derniere action explicite. La capture qui partait a chaque frappe
+    -- reparcourait tous ses panes — donc un aller-retour reseau par pane pour un
+    -- workspace vibe — 2 s apres chaque bascule, sur le thread GUI.
+    switch_to_workspace(window, pane, workspace.name)
     notify(window, 'Workspace live rejoint: ' .. workspace.name)
     return
   end
@@ -2136,13 +2416,12 @@ local function restore_workspace(window, pane, workspace, attempt)
       return
     end
 
-    window:perform_action(wezterm.action.SwitchToWorkspace { name = workspace.name }, pane)
+    -- Fenetre tout juste creee : c'est le cas ou `reconcile_workspace` rebascule.
+    switch_to_workspace(window, pane, workspace.name, { verify = true })
     return
   end
 
-  local restored = nil
-
-  restored = restore_workspace_in_current_window(window, pane, workspace)
+  local restored = restore_workspace_in_current_window(window, pane, workspace)
 
   if not restored then
     return
@@ -2151,10 +2430,97 @@ local function restore_workspace(window, pane, workspace, attempt)
   append_debug('restore done name=' .. tostring(workspace.name))
 end
 
--- Nom puis domaine : c'est a la creation qu'on decide si le workspace vit sur ce
--- PC ou sur le serveur. Le domaine n'est pas devine depuis le pane courant, sinon
--- creer un workspace distant depuis une fenetre locale imposerait d'y basculer
--- d'abord. Il sera fige dans le registre au premier ALT+r.
+-- ---------------------------------------------------------------------------
+-- CREER UN WORKSPACE : UN NOM, UN ETAT, UNE ACTION
+--
+-- Le nom saisi n'est pas forcement libre, et c'est la source de toutes les
+-- surprises du 2026-08-20. Quatre etats possibles, quatre suites :
+--
+--   LIBRE      -> on demande le domaine, on cree, on bascule, on enregistre.
+--   VIVANT     -> le nom tourne dans un mux sans etre au registre (cree la
+--                 veille, jamais ALT+r, et le mux-server a survecu au GUI). On
+--                 le rejoint et on l'enregistre. Spawner par-dessus donnait
+--                 deux fenetres mux dans le meme workspace, donc deux fenetres
+--                 a l'ecran a la bascule.
+--   ENREGISTRE -> on l'ouvre par `restore_workspace`, avec le domaine du
+--                 registre.
+--   ARCHIVE    -> on le REACTIVE, puis comme ci-dessus. Le refuser « proprement »
+--                 revenait, a l'ecran, a ne RIEN faire : la notification vit
+--                 5 s dans un coin du statut, et l'utilisateur qui vient de
+--                 taper un nom attend une fenetre, pas un message.
+--
+-- Deux invariants tiennent tout : ALT+n n'echoue JAMAIS en silence, et ne cree
+-- JAMAIS un doublon.
+--
+-- Le domaine n'est demande que dans le cas LIBRE — partout ailleurs il est deja
+-- decide, par le registre ou par les panes qui tournent. Il est alors AFFICHE
+-- dans la notification, sinon son absence passe pour une panne.
+--
+-- Le workspace entre au registre des sa creation (`save_soon`), domaine
+-- compris. Attendre un ALT+r explicite le laissait vivre dans le seul mux :
+-- absent de ALT+o comme du cycle, introuvable pour qui venait de le nommer, et
+-- perdu au premier redemarrage du mux-server.
+-- ---------------------------------------------------------------------------
+
+-- Tout ce qu'on a besoin de savoir d'un nom, en une lecture.
+local function workspace_state(name)
+  local registered = find_workspace(load_registry(), name)
+
+  return {
+    registered = registered,
+    archived = registered ~= nil and is_archived(registered),
+    live = workspace_is_live(name),
+  }
+end
+
+-- Nom deja pris : on l'OUVRE, quel que soit son etat. Un seul point de sortie.
+local function open_existing_workspace(window, pane, name, state)
+  local note = ''
+
+  if state.archived and pcall(set_workspace_archived, name, false) then
+    append_debug('creation: archive reactive name=' .. tostring(name))
+    state.registered = find_workspace(load_registry(), name)
+    note = ' (archive reactive)'
+  end
+
+  if state.registered then
+    notify(window, 'Workspace deja connu, ouverture: ' .. name
+      .. ' [' .. domains.label(state.registered.domain) .. ']' .. note)
+    restore_workspace(window, pane, state.registered)
+    return
+  end
+
+  -- Vivant mais absent du registre : rien a reconstruire, tout a rejoindre. Son
+  -- domaine est celui de ses panes, il n'y a rien a demander.
+  append_debug('creation: deja vivant, on rejoint name=' .. tostring(name))
+  switch_to_workspace(window, pane, name)
+  save_soon(name)
+  notify(window, 'Workspace deja ouvert, rejoint: ' .. name)
+end
+
+-- Nom libre : la seule branche qui cree quoi que ce soit.
+local function create_workspace(window, pane, name, domain)
+  when_domain_ready(window, domain, name, function()
+    -- Meme chemin que la restauration, et pour la meme raison : le spawn de
+    -- `SwitchToWorkspace` deposerait la fenetre dans le workspace ACTIF (cf.
+    -- `spawn_workspace_window`).
+    if not spawn_workspace_window(name, { domain = domains.spawn_domain(domain) }) then
+      notify_error(window, 'Impossible de creer le workspace: ' .. name)
+      return
+    end
+
+    -- Fenetre tout juste creee : c'est le cas ou `reconcile_workspace` rebascule.
+    switch_to_workspace(window, pane, name, { verify = true })
+
+    -- La capture part du MUX, par nom (cf. `capture_workspace_now`) : elle ne
+    -- depend ni de la bascule qui precede, ni de la fenetre GUI active au
+    -- moment ou le minuteur tombe.
+    save_soon(name)
+
+    notify(window, 'Workspace cree: ' .. name .. ' [' .. domains.label(domain) .. ']')
+  end)
+end
+
 function M.prompt_new_workspace(window, pane)
   window:perform_action(
     wezterm.action.PromptInputLine {
@@ -2164,33 +2530,39 @@ function M.prompt_new_workspace(window, pane)
         { Text = 'Nommer le nouveau Workspace: ' },
       },
       action = wezterm.action_callback(function(win, p, line)
-        if not line or line == '' then
+        -- Espaces rognes : « evacuation-list » et « evacuation-list  » seraient
+        -- deux workspaces distincts et indiscernables a l'ecran.
+        local name = type(line) == 'string' and line:match('^%s*(.-)%s*$') or nil
+
+        if not name or name == '' then
+          return
+        end
+
+        -- `default` et le parking ne sont pas des workspaces de travail : les
+        -- laisser nommer ici donnerait une entree de registre que rien ne sait
+        -- ni restaurer ni supprimer.
+        if not is_saveable_workspace(name) then
+          notify_error(win, 'Nom reserve, choisissez-en un autre: ' .. name)
           return
         end
 
         -- Le pane d'overlay du prompt vient d'etre ferme : repartir du pane
         -- actif de la fenetre pour ouvrir le selecteur suivant.
         local host_pane = win:active_pane() or p
+        local state = workspace_state(name)
 
-        domains.choose(win, host_pane, 'Domaine du workspace ' .. line, function(w, sel_pane, domain)
-          local ok, err = domains.ensure_attached(domain)
+        append_debug('creation demandee name=' .. tostring(name)
+          .. ' enregistre=' .. tostring(state.registered ~= nil)
+          .. ' archive=' .. tostring(state.archived)
+          .. ' vivant=' .. tostring(state.live))
 
-          if not ok then
-            notify_error(w, 'Domaine ' .. domains.label(domain) .. ' injoignable: ' .. tostring(err))
-            return
-          end
+        if state.registered or state.live then
+          open_existing_workspace(win, host_pane, name, state)
+          return
+        end
 
-          -- Meme chemin que la restauration, et pour la meme raison : le spawn
-          -- de `SwitchToWorkspace` deposerait la fenetre dans le workspace
-          -- ACTIF (cf. spawn_workspace_window).
-          if not spawn_workspace_window(line, { domain = domains.spawn_domain(domain) }) then
-            notify_error(w, 'Impossible de creer le workspace: ' .. line)
-            return
-          end
-
-          w:perform_action(wezterm.action.SwitchToWorkspace { name = line }, sel_pane)
-
-          notify(w, 'Workspace ' .. line .. ' [' .. domains.label(domain) .. ']')
+        domains.choose(win, host_pane, 'Domaine du workspace ' .. name, function(w, sel_pane, domain)
+          create_workspace(w, sel_pane, name, domain)
         end)
       end),
     },
@@ -2365,54 +2737,8 @@ function M.choose_registered(window, pane)
   )
 end
 
-function M.choose_delete_registered(window, pane)
-  local registry = load_registry()
-  local choices = {}
-
-  for _, workspace in ipairs(list_workspaces(registry, 'all')) do
-    local suffix = is_archived(workspace) and '  (archive)' or ''
-    table.insert(choices, {
-      id = workspace.name,
-      label = workspace_choice_label(workspace, suffix),
-    })
-  end
-
-  if #choices == 0 then
-    notify(window, 'Aucun workspace enregistre.')
-    return
-  end
-
-  window:perform_action(
-    wezterm.action.InputSelector {
-      title = 'Supprimer un workspace',
-      choices = choices,
-      fuzzy = true,
-      action = wezterm.action_callback(function(win, _, id, label)
-        local name = id or label
-
-        if not name then
-          return
-        end
-
-        local ok, removed = pcall(function()
-          return remove_workspace(name)
-        end)
-
-        if ok and removed then
-          append_debug('delete workspace name=' .. tostring(name))
-          notify(win, 'Workspace supprime: ' .. name)
-        else
-          append_debug('delete failed name=' .. tostring(name) .. ' err=' .. tostring(removed))
-          notify_error(win, 'Impossible de supprimer: ' .. name)
-        end
-      end),
-    },
-    pane
-  )
-end
-
 -- ---------------------------------------------------------------------------
--- ARCHIVER FERME LA SESSION VIVANTE
+-- ARCHIVER — ET SUPPRIMER — FERMENT LA SESSION VIVANTE
 --
 -- L'archivage n'ecrivait que le registre : les panes du workspace continuaient
 -- de tourner sur leur mux-server, indefiniment et sans que rien ne les rattache
@@ -2469,25 +2795,109 @@ local function close_workspace_session(name)
   return closed, kept
 end
 
--- SORTIR DU WORKSPACE QU'ON ARCHIVE, AVANT DE FERMER SA SESSION.
+-- SUPPRIMER EST DEFINITIF : DEUX VAGUES, PUIS ON DIT CE QUI RESTE.
 --
--- Archiver ferme desormais les panes du workspace. Si c'est celui ou l'on se
--- trouve, on les ferme sous ses propres pieds : la fenetre resterait sur un
--- workspace vide, et c'est WezTerm qui deciderait seul de la suite — le premier
--- workspace venu, parking compris.
+-- `close_workspace_session` n'envoie `exit` qu'aux panes dont le premier plan
+-- est un shell. Politesse defendable a l'archivage, inutilisable ici : d'abord
+-- parce que supprimer, c'est ne plus rien vouloir de ce workspace ; ensuite
+-- parce que `get_foreground_process_info` ne remonte RIEN sur un pane mux, donc
+-- `is_shell` repond non a tout et la session survivait intacte (journal du
+-- 2026-08-20 : « session fermee name=evacuation-list fermes=0 conserves=1 »).
+-- Le workspace supprime restait vivant et invisible, et ALT+n sur le meme nom
+-- le REJOIGNAIT au lieu d'en creer un neuf, avec son ancien domaine : c'est le
+-- « toujours sur localmux » du meme jour.
+--
+-- PAS `CloseCurrentPane`. Essaye le 2026-08-20, retire dans l'heure : l'action
+-- s'applique au pane ACTIF de la GuiWindow, pas a celui qu'on lui passe. Elle
+-- n'a jamais touche la cible (`evacuation-list` toujours la, pane 9 inchange
+-- apres deux suppressions) et a ferme a la place un pane de `chaud-devant`, le
+-- workspace ou l'utilisateur se trouvait. Le pane de l'appelant n'est pas une
+-- variable d'ajustement. Cette action ne vaut que pour un pane deja actif —
+-- c'est le cas de l'ecran de connexion (`close_waiting_screen`), pas le notre.
+--
+-- Reste donc ce que le mux accepte de tout pane, local comme distant : de
+-- l'ENTREE. Deux vagues — `exit`, puis Ctrl-C + `exit` pour le pane ou tournait
+-- autre chose et qui a recu la premiere comme une frappe — et un bilan honnete
+-- de ce qui a survecu. Un orphelin silencieux, c'est exactement ce qui a ramene
+-- `evacuation-list` a chaque fois.
+local KILL_SECOND_WAVE = 1.5
+local KILL_REPORT_DELAY = 4
+
+local function each_workspace_pane(name, action)
+  local count = 0
+
+  for _, mux_window in ipairs(workspace_mux_windows(name)) do
+    for _, tab in ipairs(mux_window_tabs(mux_window)) do
+      local ok, panes = pcall(function()
+        return tab:panes()
+      end)
+
+      if ok and type(panes) == 'table' then
+        for _, pane in ipairs(panes) do
+          if pcall(action, pane) then
+            count = count + 1
+          end
+        end
+      end
+    end
+  end
+
+  return count
+end
+
+local function kill_workspace_session(window, name)
+  local sent = each_workspace_pane(name, function(pane)
+    pane:send_text('exit\r')
+  end)
+
+  append_debug('session fermee name=' .. tostring(name) .. ' exit envoyes=' .. tostring(sent))
+
+  if not (wezterm.time and wezterm.time.call_after) then
+    return sent
+  end
+
+  wezterm.time.call_after(KILL_SECOND_WAVE, function()
+    local retried = each_workspace_pane(name, function(pane)
+      pane:send_text('\x03')
+      pane:send_text('exit\r')
+    end)
+
+    if retried > 0 then
+      append_debug('session deuxieme vague name=' .. tostring(name)
+        .. ' panes=' .. tostring(retried))
+    end
+  end)
+
+  wezterm.time.call_after(KILL_REPORT_DELAY, function()
+    local left = workspace_pane_count(name)
+
+    if left > 0 then
+      notify_error(window, 'Workspace supprime, mais ' .. left .. ' panes resistent: ' .. name)
+    end
+  end)
+
+  return sent
+end
+
+-- SORTIR DU WORKSPACE QU'ON QUITTE, AVANT DE FERMER SA SESSION.
+--
+-- Archiver comme supprimer ferment les panes du workspace. Si c'est celui ou
+-- l'on se trouve, on les ferme sous ses propres pieds : la fenetre resterait
+-- sur un workspace vide, et c'est WezTerm qui deciderait seul de la suite — le
+-- premier workspace venu, parking compris.
 --
 -- On part donc vers le SUIVANT, dans l'ordre du registre et par `restore_
 -- workspace`, exactement comme `activate_relative` : un workspace eteint doit
 -- etre rouvert depuis son snapshot, pas seulement designe comme actif.
 --
--- A APPELER AVANT `set_workspace_archived` : le calcul du suivant part de la
--- liste des workspaces ACTIFS, dans laquelle celui qu'on archive doit encore
--- figurer pour qu'on sache d'ou l'on part.
+-- A APPELER AVANT `set_workspace_archived` ou `remove_workspace` : le calcul du
+-- suivant part de la liste des workspaces ACTIFS, dans laquelle celui qu'on
+-- quitte doit encore figurer pour qu'on sache d'ou l'on part.
 --
 -- Sans autre workspace actif, repli sur le workspace de passage : il ne persiste
 -- rien, mais il existe toujours et vit sur le domaine integre, donc il ne peut
 -- pas etre injoignable.
-local function leave_archived_workspace(window, name)
+local function leave_workspace(window, name)
   local pane_ok, pane = pcall(function()
     return window:active_pane()
   end)
@@ -2510,12 +2920,12 @@ local function leave_archived_workspace(window, name)
   end
 
   if target then
-    append_debug('archive depart name=' .. tostring(name) .. ' vers=' .. tostring(target.name))
+    append_debug('depart name=' .. tostring(name) .. ' vers=' .. tostring(target.name))
     restore_workspace(window, pane, target)
     return target.name
   end
 
-  append_debug('archive depart name=' .. tostring(name)
+  append_debug('depart name=' .. tostring(name)
     .. ' vers=' .. scratch_workspace .. ' (aucun autre workspace actif)')
 
   pcall(function()
@@ -2526,6 +2936,81 @@ local function leave_archived_workspace(window, name)
   end)
 
   return scratch_workspace
+end
+
+-- SUPPRIMER, C'EST ARCHIVER SANS GARDER L'ENTREE - ET SANS RIEN MENAGER.
+--
+-- Meme depart si l'on s'y trouve, mais la session est TUEE et non priee de
+-- sortir (cf. `kill_workspace_session`). Retirer l'entree en laissant tourner les panes
+-- fabriquait un ORPHELIN : une fenetre mux que plus aucune liste ne montre, que
+-- le rattachement suivant reimporte, et qui ressort en double des qu'on recree
+-- un workspace du meme nom. C'est toute l'histoire d'`evacuation-list` le
+-- 2026-08-20.
+function M.choose_delete_registered(window, pane)
+  local registry = load_registry()
+  local choices = {}
+
+  for _, workspace in ipairs(list_workspaces(registry, 'all')) do
+    local suffix = is_archived(workspace) and '  (archive)' or ''
+    table.insert(choices, {
+      id = workspace.name,
+      label = workspace_choice_label(workspace, suffix),
+    })
+  end
+
+  if #choices == 0 then
+    notify(window, 'Aucun workspace enregistre.')
+    return
+  end
+
+  window:perform_action(
+    wezterm.action.InputSelector {
+      title = 'Supprimer un workspace',
+      choices = choices,
+      fuzzy = true,
+      action = wezterm.action_callback(function(win, _, id, label)
+        local name = id or label
+
+        if not name then
+          return
+        end
+
+        -- Le depart se decide AVANT la suppression, tant que le workspace
+        -- figure encore dans la liste des actifs (cf. `leave_workspace`).
+        local moved_to = nil
+
+        if canonical_workspace_name(workspace_name(win)) == name then
+          moved_to = leave_workspace(win, name)
+        end
+
+        local ok, removed = pcall(function()
+          return remove_workspace(name)
+        end)
+
+        if not ok or not removed then
+          append_debug('delete failed name=' .. tostring(name) .. ' err=' .. tostring(removed))
+          notify_error(win, 'Impossible de supprimer: ' .. name)
+          return
+        end
+
+        local killed = kill_workspace_session(win, name)
+        local message = 'Workspace supprime: ' .. name
+
+        if moved_to then
+          message = message .. ' -> ' .. moved_to
+        end
+
+        if killed > 0 then
+          message = message .. ' (' .. killed .. ' panes fermes)'
+        end
+
+        append_debug('delete workspace name=' .. tostring(name)
+          .. ' panes fermes=' .. tostring(killed))
+        notify(win, message)
+      end),
+    },
+    pane
+  )
 end
 
 function M.choose_archive(window, pane)
@@ -2570,7 +3055,7 @@ function M.choose_archive(window, pane)
           capture_workspace_now(name)
 
           if leaving then
-            moved_to = leave_archived_workspace(win, name)
+            moved_to = leave_workspace(win, name)
           end
 
           return set_workspace_archived(name, true)

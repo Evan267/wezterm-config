@@ -83,8 +83,11 @@ passe par `ALT` + `SHIFT` + `r` (rejeu depuis `workspaces.json`).
   fenetre courante (localmux ↔ vibe). N'affecte que les spawns sans contexte ; les
   workspaces enregistres gardent le domaine fige dans `workspaces.json`.
 * **Domaine memorise par workspace** : `ALT` + `n` demande le nom **puis** le
-  domaine. Le domaine est enregistre dans `workspaces.json` et rejoue a la
-  restauration, quel que soit le domaine de la fenetre depuis laquelle on ouvre.
+  domaine — uniquement si le nom est libre, un nom deja pris gardant le sien —
+  et enregistre aussitot le workspace dans `workspaces.json` — il
+  apparait donc immediatement dans `ALT` + `o` et dans le cycle, sans attendre un
+  `ALT` + `r`. Le domaine est rejoue a la restauration, quel que soit le domaine
+  de la fenetre depuis laquelle on ouvre.
   Les listes (`ALT` + `o`, `ALT` + `d`, `ALT` + `a`, `ALT` + `u`) affichent
   `nom  [domaine]`, filtrable au clavier (taper `vibe` ou `localmux`).
 
@@ -96,12 +99,12 @@ Les commandes de workspace utilisent uniquement `ALT` comme modificateur. Les va
 
 | Raccourci             | Action                          | Description                                                                                                                                          |
 | :-------------------- | :------------------------------ | :--------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ALT` + `n`           | **Nouveau Workspace**           | Demande un nom puis un domaine (localmux / vibe), et bascule vers ce workspace non enregistre                                                         |
+| `ALT` + `n`           | **Nouveau Workspace**           | Demande un nom. **Nom libre** : demande le serveur (localmux / vibe), cree le workspace, **y redirige la fenetre** (bascule verifiee, puis focus) et l'enregistre aussitot. **Nom deja pris** : ni doublon ni question de serveur, celui-ci etant deja decide — enregistre, il est ouvert avec son domaine ; archive, il est reactive puis ouvert ; vivant dans un mux sans etre au registre, il est rejoint et enregistre. Chaque cas est annonce dans la notification                                                         |
 | `ALT` + `t`           | **Renommer Tab**                | Demande un nom pour le tab actif puis enregistre le workspace courant                                                                                |
 | `ALT` + `r`           | **Enregistrer Workspace**       | Enregistre ou met a jour le workspace actif                                                                                                          |
 | `ALT` + `o`           | **Ouvrir Workspace ici**        | Affiche les workspaces enregistres et ouvre la selection dans la fenetre courante                                                                    |
 | `ALT` + `SHIFT` + `r` | **Tout restaurer**              | Restaure tous les workspaces actifs, chacun dans sa fenetre (workspaces deja ouverts ignores). A utiliser apres un redemarrage d'un mux-server (vibe, ou le mux local apres un reboot) |
-| `ALT` + `d`           | **Supprimer Workspace**         | Affiche les workspaces enregistres (actifs et archives) et supprime la selection du registre                                                         |
+| `ALT` + `d`           | **Supprimer Workspace**         | Affiche les workspaces enregistres (actifs et archives) et supprime la selection du registre **et ferme sa session vivante** — `exit` a tous les panes, puis Ctrl-C + `exit` a ceux qui resistent, et ce qui survit est annonce (depart vers le workspace suivant si c'est celui ou l'on se trouve) |
 | `ALT` + `a`           | **Archiver Workspace**          | Liste les workspaces actifs et archive la selection : masquee de `ALT+o` et du cycle, conservee dans le registre, **et sa session vivante est fermee** (depart vers le workspace suivant si c'est celui ou l'on se trouve) |
 | `ALT` + `u`           | **Desarchiver Workspace**       | Liste les workspaces archives et reactive la selection : redevient visible dans `ALT+o` et le cycle, et se rouvre depuis son snapshot, sa session ayant ete fermee a l'archivage |
 | `ALT` + `SHIFT` + `d` | **Changer de domaine**          | Bascule le domaine par defaut de la fenetre courante entre `localmux` (ce PC) et `vibe` (serveur distant)                                            |
@@ -123,7 +126,7 @@ Les commandes de workspace utilisent uniquement `ALT` comme modificateur. Les va
 * **Restauration workspace** : Si le workspace est deja ouvert, la config le rejoint sans relancer les commandes. Sinon, elle recree les tabs/panes, retourne dans les repertoires sauvegardes et relance la derniere commande quand elle est disponible. Certaines commandes ne sont jamais rejouees (triviales ou dangereuses : `cd`, `clear`, `ls`, `exit`, `wezterm-mux-server`, …).
 * **Auto-sauvegarde** : Toutes les 60 s, les workspaces **deja enregistres** sont rafraichis depuis leurs fenetres vivantes (cwd et commandes recents), sans en creer de nouveaux ni ecraser une sauvegarde par un etat vide. Objectif : que `ALT` + `Shift` + `r` reparte d'un etat recent apres un redemarrage du mux-server.
 * **Perte au redemarrage du mux-server** : Les panes tournent comme process enfants d'un `wezterm-mux-server` — celui de vibe, ou le mux local, qui meurt avec la session Windows (deconnexion, reboot). S'il redemarre, ils meurent avec lui (le mux-server ne persiste pas sur disque). `ALT` + `Shift` + `r` relance alors tous les workspaces actifs depuis `workspaces.json`.
-* **Suppression workspace** : La suppression retire uniquement l'entree du registre; elle ne ferme pas un workspace deja ouvert.
+* **Suppression workspace** : `ALT` + `d` est **definitif** — l'entree quitte le registre et la session vivante est fermee : `exit` part vers **tous** les panes (et non les seuls reconnus comme shells, ce que l'archivage tente sans y parvenir sur un pane mux), puis Ctrl-C + `exit` vers ceux qui n'ont pas bronche. Ce qui survit malgre tout est annonce dans une notification plutot que laisse en orphelin. Si c'est le workspace courant, on part vers le suivant avant la fermeture. Retirer l'entree en laissant tourner les panes fabriquait un orphelin : une fenetre mux qu'aucune liste ne montre, que le rattachement suivant reimporte, et que `ALT` + `n` sur le meme nom rejoignait au lieu d'en creer un neuf — avec son ancien domaine.
 * **Archivage workspace** : L'archivage (`ALT` + `a`) retire le workspace des listes du quotidien (`ALT` + `o` et cycle `ALT` + `←`/`→`) sans rien supprimer du registre : tabs, panes et cwd restent intacts dans `workspaces.json` (marqueur `archived_at`), et `ALT` + `u` le reactive.
   En revanche il **ferme la session vivante** : un snapshot est pris, puis `exit` est envoye au shell de chaque pane. Sans cela les panes tournaient indefiniment sur leur mux-server sans que personne ne les rattache jamais — celui de vibe est relance par tache planifiee, donc ses fenetres survivent aux deconnexions comme aux redemarrages du poste. Les panes ou tourne autre chose qu'un shell sont laisses en place et annonces dans la notification.
   Si on archive le workspace **courant**, on est deplace vers le suivant avant la fermeture, pour ne pas fermer ses panes sous ses propres pieds. Desarchiver puis rouvrir reconstruit alors le workspace depuis son snapshot.

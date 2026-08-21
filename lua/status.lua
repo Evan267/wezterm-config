@@ -70,6 +70,28 @@ local function active_workspace(window)
   return 'default'
 end
 
+-- Scheme de la FENETRE, sans reconstruire toute la config. `effective_config()`
+-- reconstruit la table complete a chaque appel : le payer une fois par seconde
+-- et par fenetre pour en lire UN champ etait le plus cher des trois travers
+-- releves le 2026-08-21 (cf. lua/notify.lua). Le scheme est deja pose en
+-- override par fenetre par lua/options.lua, avec le dernier connu dans GLOBAL.
+local function window_color_scheme(window)
+  local ok, overrides = pcall(function()
+    return window:get_config_overrides()
+  end)
+
+  if ok and type(overrides) == 'table' and overrides.color_scheme then
+    return overrides.color_scheme
+  end
+
+  return wezterm.GLOBAL.dynamic_color_scheme
+end
+
+-- Dernier statut REELLEMENT pose, par fenetre : `set_left_status` salit la barre
+-- meme quand le texte ne change pas, donc le reposer a chaque tick fait
+-- repeindre la fenetre pour rien.
+local last_status = {}
+
 function M.apply(config)
   config.use_fancy_tab_bar = false
   config.hide_tab_bar_if_only_one_tab = false
@@ -77,8 +99,8 @@ function M.apply(config)
   config.show_new_tab_button_in_tab_bar = false
 
   wezterm.on('update-status', function(window, pane)
-    local overrides = window:effective_config()
-    local c = colors_for_scheme(overrides.color_scheme)
+    local scheme = window_color_scheme(window)
+    local c = colors_for_scheme(scheme)
     local workspace = active_workspace(window)
     -- Domaine REEL du pane actif (et non le defaut de la fenetre) : c'est la
     -- seule indication fiable de la machine ou tourne ce qu'on a sous les yeux,
@@ -86,6 +108,22 @@ function M.apply(config)
     -- fenetre quand le pane n'en expose pas (overlay, pane mort).
     local domain = domains.pane_domain(pane) or domains.window_default(window)
     local domain_fg = domains.is_remote(domain) and c.accent or c.muted
+
+    local ok_id, window_id = pcall(function()
+      return window:window_id()
+    end)
+
+    -- Le statut ne depend que de ces trois valeurs : tant qu'elles ne bougent
+    -- pas, il n'y a rien a reposer.
+    local key = tostring(scheme) .. '\0' .. tostring(workspace)
+      .. '\0' .. tostring(domains.label(domain))
+    local memo = (ok_id and window_id) or 'sans-id'
+
+    if last_status[memo] == key then
+      return
+    end
+
+    last_status[memo] = key
 
     window:set_left_status(wezterm.format {
       { Background = { Color = c.edge } },

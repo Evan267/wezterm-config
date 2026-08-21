@@ -1,8 +1,6 @@
 local wezterm = require 'wezterm'
 local M = {}
 
-local DYNAMIC_COLOR_SCHEME_EVENT_VERSION = 6
-
 local function color_scheme_for_appearance(appearance)
     appearance = appearance or 'Dark'
 
@@ -28,30 +26,94 @@ local function current_color_scheme(window)
     return color_scheme_for_appearance(appearance)
 end
 
+-- THEME PAR FENETRE, ET NON PAR CONFIG GLOBALE.
+--
+-- `config.color_scheme` est calcule UNE fois par evaluation de la config, hors
+-- de toute fenetre. Les fenetres nees ensuite — celles des workspaces qu'on
+-- cree en cours de session — heritent de cette valeur figee : c'est ainsi qu'un
+-- nouveau workspace s'ouvrait en CLAIR alors que toutes les autres fenetres
+-- etaient en sombre (constate le 2026-08-20). L'ancien handler ne rattrapait
+-- pas le coup : il ne comparait qu'a une valeur unique dans `wezterm.GLOBAL`,
+-- donc une fois la premiere fenetre corrigee, les suivantes n'avaient plus rien
+-- qui les distingue et restaient sur le scheme fige.
+--
+-- On applique donc le scheme PAR FENETRE, depuis `window:get_appearance()`
+-- (appel natif, sans le reg.exe synchrone d'avant), et par
+-- `set_config_overrides` plutot que par `ReloadConfiguration` : un rechargement
+-- de config invalide l'etat de rendu, repeint les panes mux en blocs et tue les
+-- timers en vol. Les autres overrides sont conserves — `default_domain` porte
+-- le choix local/distant de la fenetre (ALT+SHIFT+D).
+--
+-- Handler repose a CHAQUE evaluation du module, sans garde-fou `GLOBAL` : un
+-- tel garde-fou empechait tout re-enregistrement apres que WezTerm eut vide sa
+-- table de handlers au premier rechargement (meme piege que la maximisation
+-- ci-dessous). Plusieurs exemplaires ne font aucun degat : l'action est
+-- idempotente, elle ne fait rien quand le scheme est deja le bon.
 function M.apply_dynamic_color_scheme()
-    if wezterm.GLOBAL.dynamic_color_scheme_event_version == DYNAMIC_COLOR_SCHEME_EVENT_VERSION then
-        return
-    end
+    wezterm.GLOBAL.dynamic_color_scheme = wezterm.GLOBAL.dynamic_color_scheme
+        or current_color_scheme()
 
-    wezterm.GLOBAL.dynamic_color_scheme_event_version = DYNAMIC_COLOR_SCHEME_EVENT_VERSION
-    wezterm.GLOBAL.dynamic_color_scheme = wezterm.GLOBAL.dynamic_color_scheme or current_color_scheme()
-
-    wezterm.on('update-status', function(window, pane)
-        if wezterm.GLOBAL.dynamic_color_scheme_event_version ~= DYNAMIC_COLOR_SCHEME_EVENT_VERSION then
+    wezterm.on('update-status', function(window)
+        if not wezterm.gui or not window then
             return
         end
 
-        local color_scheme = current_color_scheme(window)
+        local ok, appearance = pcall(function()
+            return window:get_appearance()
+        end)
 
-        if color_scheme and color_scheme ~= wezterm.GLOBAL.dynamic_color_scheme then
+        if not ok then
+            return
+        end
+
+        local color_scheme = color_scheme_for_appearance(appearance)
+
+        -- MEMO PAR FENETRE, AVANT DE TOUCHER A LA CONFIG.
+        --
+        -- `get_config_overrides` recopie la table d'overrides et
+        -- `set_config_overrides` INVALIDE le rendu de la fenetre. Les appeler a
+        -- chaque tick pour reposer une valeur inchangee, c'est demander un
+        -- repeint une fois par seconde et par fenetre — l'un des trois travers
+        -- releves le 2026-08-21 sur le GUI fige (cf. lua/notify.lua).
+        --
+        -- La cle est SCALAIRE et par fenetre, comme la maximisation ci-dessous :
+        -- `wezterm.GLOBAL` ne conserve pas la mutation d'une table imbriquee.
+        local ok_id, window_id = pcall(function()
+            return window:window_id()
+        end)
+
+        if not ok_id or window_id == nil then
+            return
+        end
+
+        local flag = 'dynamic_color_scheme_' .. tostring(window_id)
+
+        if wezterm.GLOBAL[flag] == color_scheme then
+            return
+        end
+
+        local overrides_ok, overrides = pcall(function()
+            return window:get_config_overrides()
+        end)
+
+        overrides = (overrides_ok and overrides) or {}
+
+        if overrides.color_scheme == color_scheme then
+            wezterm.GLOBAL[flag] = color_scheme
+            return
+        end
+
+        overrides.color_scheme = color_scheme
+
+        local applied = pcall(function()
+            window:set_config_overrides(overrides)
+        end)
+
+        -- Memo pose seulement si l'ecriture a pris : sinon on reessaiera au tick
+        -- suivant, ce qui est exactement ce qu'on veut d'un echec.
+        if applied then
+            wezterm.GLOBAL[flag] = color_scheme
             wezterm.GLOBAL.dynamic_color_scheme = color_scheme
-            -- On repart d'overrides vides pour forcer la relecture du scheme,
-            -- MAIS `default_domain` doit survivre : c'est lui qui porte le choix
-            -- local/distant de la fenetre (ALT+SHIFT+D, cf. lua/domains.lua).
-            -- L'effacer renvoyait silencieusement la fenetre sur le domaine global.
-            local overrides = window:get_config_overrides() or {}
-            window:set_config_overrides({ default_domain = overrides.default_domain })
-            window:perform_action(wezterm.action.ReloadConfiguration, pane)
         end
     end)
 end
