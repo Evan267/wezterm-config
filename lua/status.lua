@@ -87,10 +87,41 @@ local function window_color_scheme(window)
   return wezterm.GLOBAL.dynamic_color_scheme
 end
 
+-- Workspace ACTIF DU MUX, et non celui de la fenetre : c'est une valeur unique
+-- pour toute l'application, donc identique pour toutes les fenetres d'un meme
+-- tick. Elle sert de generation au memo ci-dessous ; s'appuyer sur le workspace
+-- de CHAQUE fenetre ferait osciller cette generation des que deux fenetres
+-- tiquent, et viderait le memo en permanence.
+local function mux_active_workspace()
+  local ok, name = pcall(function()
+    if wezterm.mux and wezterm.mux.get_active_workspace then
+      return wezterm.mux.get_active_workspace()
+    end
+
+    return nil
+  end)
+
+  return (ok and name) or nil
+end
+
 -- Dernier statut REELLEMENT pose, par fenetre : `set_left_status` salit la barre
 -- meme quand le texte ne change pas, donc le reposer a chaque tick fait
 -- repeindre la fenetre pour rien.
+--
+-- LE MEMO SE VIDE A CHAQUE BASCULE DE WORKSPACE, sans quoi il fait afficher le
+-- nom d'un AUTRE workspace. `window:window_id()` est l'id de la fenetre MUX, pas
+-- de la fenetre GUI : basculer de workspace ne cree pas de fenetre GUI,
+-- `reconcile_workspace` (wezterm-gui/src/frontend.rs) REBRANCHE la fenetre GUI
+-- existante sur la fenetre mux de la cible (`TermWindowNotif::
+-- SwitchToMuxWindow`). L'id change donc a chaque bascule, alors que
+-- `left_status` — porte par la fenetre GUI, et que ce rebranchement ne remet PAS
+-- a zero — reste celui du workspace precedent. Revenir sur un workspace deja
+-- visite retombait ainsi sur son ancien memo, inchange : plus rien n'etait
+-- repose, et la barre gardait indefiniment le nom du workspace d'ou l'on venait
+-- (constate le 2026-08-21 en enchainant les bascules). Vider le memo a la
+-- bascule coute un repost par fenetre et par bascule, et rien au repos.
 local last_status = {}
+local last_active_workspace = nil
 
 function M.apply(config)
   config.use_fancy_tab_bar = false
@@ -99,6 +130,16 @@ function M.apply(config)
   config.show_new_tab_button_in_tab_bar = false
 
   wezterm.on('update-status', function(window, pane)
+    -- Generation du memo : une bascule de workspace rebranche les fenetres GUI
+    -- sur d'autres fenetres mux, donc les memos indexes par id de fenetre mux ne
+    -- decrivent plus ce qui est a l'ecran.
+    local active = mux_active_workspace()
+
+    if last_active_workspace ~= active then
+      last_active_workspace = active
+      last_status = {}
+    end
+
     local scheme = window_color_scheme(window)
     local c = colors_for_scheme(scheme)
     local workspace = active_workspace(window)

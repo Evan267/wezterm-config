@@ -21,9 +21,36 @@ local active_notification = nil
 --
 -- Memo par fenetre, et non global : deux fenetres n'affichent pas forcement la
 -- meme chose, et l'une ne doit pas empecher l'autre de se mettre a jour.
+--
+-- VIDE A CHAQUE BASCULE DE WORKSPACE, pour la meme raison qu'en statut gauche
+-- (cf. lua/status.lua) : la cle est l'id de la fenetre MUX, et une bascule
+-- rebranche la fenetre GUI sur une autre fenetre mux sans toucher au
+-- `right_status` deja pose. Sans ce vidage, une notification identique a celle
+-- deja memoisee pour la fenetre mux d'arrivee n'etait jamais reposee, donc
+-- jamais affichee.
 local last_posted = {}
+local last_active_workspace = nil
+
+local function forget_memo_on_switch()
+  local ok, name = pcall(function()
+    if wezterm.mux and wezterm.mux.get_active_workspace then
+      return wezterm.mux.get_active_workspace()
+    end
+
+    return nil
+  end)
+
+  local active = (ok and name) or nil
+
+  if last_active_workspace ~= active then
+    last_active_workspace = active
+    last_posted = {}
+  end
+end
 
 local function render(window)
+  forget_memo_on_switch()
+
   local text = active_notification and active_notification.text or ''
 
   local ok, window_id = pcall(function()

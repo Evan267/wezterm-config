@@ -696,6 +696,35 @@ controle avec `string.char(13)` plutot que `
   `update-status` doit etre garde par un memo scalaire dans `wezterm.GLOBAL`
   (une cle par fenetre, `GLOBAL` ne conservant pas la mutation d'une table
   imbriquee).
+- **`window:window_id()` IDENTIFIE UNE FENETRE MUX, PAS UNE FENETRE GUI — tout
+  memo indexe dessus doit se vider a chaque bascule de workspace.** Basculer de
+  workspace ne cree pas de fenetre GUI : `reconcile_workspace`
+  (wezterm-gui/src/frontend.rs) REBRANCHE les fenetres GUI existantes sur les
+  fenetres mux de la cible (`TermWindowNotif::SwitchToMuxWindow`). L'id renvoye
+  par `window:window_id()` change donc a chaque bascule, alors que ce qui est
+  affiche — `left_status`, `right_status`, les overrides de config — appartient a
+  la fenetre GUI et n'est PAS remis a zero par le rebranchement.
+  Consequence constatee le 2026-08-21 : en enchainant les bascules, la barre
+  gardait le nom du workspace PRECEDENT. Le memo de `lua/status.lua`, indexe par
+  id de fenetre mux, retombait au retour sur l'entree laissee lors du passage
+  precedent dans ce workspace ; identique, elle faisait sauter le repost, et plus
+  personne ne corrigeait le `left_status` pose entre-temps pour un autre
+  workspace. Ce n'est pas un travers de « bascule rapide » : n'importe quel
+  retour sur un workspace deja visite le declenche.
+  `lua/status.lua` et `lua/notify.lua` vident donc leur memo des que
+  `wezterm.mux.get_active_workspace()` change (un repost par fenetre et par
+  bascule, rien au repos). Prendre le workspace du MUX et non celui de la fenetre
+  est delibere : la valeur est unique pour toute l'application, donc stable quand
+  plusieurs fenetres tiquent. Meme piege pour les drapeaux `wezterm.GLOBAL` de
+  `lua/options.lua` (`startup_maximize_done_<id>`, `dynamic_color_scheme_<id>`) :
+  ils repartent a zero a chaque bascule — sans degat, les deux actions etant
+  idempotentes, mais une fenetre demaximisee se re-maximise a la bascule
+  suivante.
+  Il n'existe pas d'identifiant de fenetre GUI cote Lua : c'est bien un vidage de
+  memo qu'il faut, pas une meilleure cle.
+  Corollaire d'affichage : le nom du workspace se met a jour au tick suivant, soit
+  jusqu'a `status_update_interval` (1000 ms) apres la bascule. Aucun evenement
+  WezTerm ne signale le rebranchement.
 - Les plugins WezTerm peuvent necessiter un acces reseau au premier chargement.
 - Les raccourcis documentes ne sont fiables que si `lua/keys.lua` est effectivement applique dans `wezterm.lua`.
 - Eviter de reintroduire un plugin de persistance de session sans validation specifique sous Windows.

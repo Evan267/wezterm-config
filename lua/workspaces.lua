@@ -3146,7 +3146,15 @@ function M.activate_relative(window, pane, offset)
     return
   end
 
-  local _, index = find_workspace({ workspaces = workspaces }, canonical_workspace_name(workspace_name(window)))
+  -- D'OU L'ON PART SE LIT SUR LE MUX, pas sur la GuiWindow (`active_workspace`,
+  -- et non `workspace_name`). Une bascule met l'actif du mux a jour tout de
+  -- suite, alors que la fenetre GUI n'apprend la sienne qu'au rebranchement
+  -- (`TermWindowNotif::SwitchToMuxWindow`, cf. `switch_to_workspace`). Sous une
+  -- rafale de ALT+SHIFT+fleche, `window:active_workspace()` repondait encore le
+  -- workspace PRECEDENT : on recalculait le meme voisin et la deuxieme frappe ne
+  -- menait nulle part.
+  local from = active_workspace(window) or workspace_name(window)
+  local _, index = find_workspace({ workspaces = workspaces }, canonical_workspace_name(from))
 
   if not index then
     index = offset > 0 and 0 or 1
